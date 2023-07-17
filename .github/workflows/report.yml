@@ -77,7 +77,7 @@ jobs:
           cp _site/draft2020-12.html _site/index.html
 
       - name: Upload artifact
-        uses: actions/upload-pages-artifact@v1
+        uses: actions/upload-pages-artifact@v2
 
   deploy:
     environment:
