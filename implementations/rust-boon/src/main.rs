@@ -11,19 +11,21 @@ fn main() -> Result<(), Box<dyn Error>> {
         let cmd = request["cmd"].as_str().ok_or("no command")?;
         match cmd {
             "start" => {
+                let osinfo = os_info::get();
                 started = true;
                 if request["version"] != 1 {
                     Err("not version 1")?;
                 }
                 let response = json!({
-                    "ready": true,
                     "version": 1,
                     "implementation": {
                         "language": "rust",
                         "name": "boon",
                         "version": env!("BOON_VERSION"),
+                        "documentation": "https://docs.rs/boon",
                         "homepage": "https://github.com/santhosh-tekuri/boon",
-                        "issues": "htps://github.com/santhosh-tekuri/boon/issues",
+                        "issues": "https://github.com/santhosh-tekuri/boon/issues",
+                        "source": "https://github.com/santhosh-tekuri/boon",
                         "dialects": [
                             "https://json-schema.org/draft/2020-12/schema",
                             "https://json-schema.org/draft/2019-09/schema",
@@ -31,6 +33,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                             "http://json-schema.org/draft-06/schema#",
                             "http://json-schema.org/draft-04/schema#",
                         ],
+                        "os": osinfo.os_type(),
+                        "os_version": osinfo.version().to_string(),
+                        "language_version": rustc_version_runtime::version().to_string(),
                     }
                 });
                 println!("{response}");
@@ -53,8 +58,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     compiler.set_default_draft(draft);
                 }
                 if let Value::Object(obj) = &case["registry"] {
-                    compiler.register_url_loader("http", Box::new(MapUrlLoader(obj.clone())));
-                    compiler.register_url_loader("https", Box::new(MapUrlLoader(obj.clone())));
+                    compiler.use_loader(Box::new(MapUrlLoader(obj.clone())));
                 }
                 let fake_url = "http://fake.com/schema.json";
                 if let Err(e) = compiler.add_resource(fake_url, case["schema"].clone()) {

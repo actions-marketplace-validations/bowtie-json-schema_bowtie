@@ -1,91 +1,219 @@
-name: Test Suite Report
+# This workflow is the main workflow for regenerating the data needed for Bowtie's UI.
+# It retests all of Bowtie's supported implementations, publishing the reports (and other auxiliary metadata) for use in the frontend.
+name: Collect New Test Results
 
 on:
-  release:
-    types: [published]
+  workflow_call:
+    inputs:
+      bowtie-version:
+        type: string
+        required: false
+        default: ""
+      report_benchmark_artifact_in_scope:
+        required: false
+        type: boolean
   workflow_dispatch:
   schedule:
-    # Daily at 2:15
-    - cron: "15 2 * * *"
+    # Every 6 hours, at 15 past the hour
+    - cron: "15 */6 * * *"
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: "pages"
   cancel-in-progress: true
 
 jobs:
-  test:
+  dialects:
+    runs-on: ubuntu-latest
+    outputs:
+      dialects: ${{ steps.dialects-matrix.outputs.dialects }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Collect supported dialects
+        id: dialects-matrix
+        run: |
+          printf 'dialects=%s\n' "$(jq -c '[.[].shortName]' data/dialects.json)" >> $GITHUB_OUTPUT
+
+  regenerate-reports:
+    needs: dialects
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        version:
-          - draft2020-12
-          - draft2019-09
-          - draft7
-          - draft6
-          - draft4
-          - draft3
+        version: ${{ fromJson(needs.dialects.outputs.dialects) }}
 
     steps:
-      # FIXME: we can skip checking out if we are able to list all images in
-      #        the image repository
-      - uses: actions/checkout@v3
-
-      - uses: actions/setup-python@v4
-        with:
-          python-version: "3.x"
+      - uses: actions/checkout@v6
 
       - name: Install Bowtie
-        run: python3 -m pip install bowtie-json-schema
-
-      - name: Generate the Report
-        run: |
-          bowtie suite $(find implementations/ -mindepth 1 -maxdepth 1 -type d | sed 's/implementations\//-i /') https://github.com/json-schema-org/JSON-Schema-Test-Suite/tree/main/tests/${{ matrix.version }} | tee >(gzip >${{ matrix.version }}.json.gz) | bowtie report --badges badges --generate-dialect-navigation --out ${{ matrix.version }}.html
-
-      - uses: actions/upload-artifact@v3
+        uses: ./
         with:
-          name: report
-          path: |
-            ${{ matrix.version }}.html
-            ${{ matrix.version }}.json.gz
-            badges/
+          version: ${{ inputs.bowtie-version }}
 
-  collect:
-    runs-on: ubuntu-latest
-    needs: test
-
-    steps:
-      - name: Setup Pages
-        id: pages
-        uses: actions/configure-pages@v3
-
-      - run: mkdir _site
-
-      - name: Download the reports
-        uses: actions/download-artifact@v3
-        with:
-          name: report
-          path: _site
-
-      - name: Finish the site structure setup
+      - name: Generate a New Report
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
-          cp _site/draft2020-12.html _site/index.html
+          bowtie suite $(bowtie filter-implementations | sed 's/^/-i /') https://github.com/json-schema-org/JSON-Schema-Test-Suite/tree/main/tests/${{ matrix.version }} >${{ matrix.version }}.json
 
-      - name: Upload artifact
-        uses: actions/upload-pages-artifact@v1
+      # This is useful to debug whether Bowtie accidentally fetched some huge
+      # number of container images.
+      - name: Show what images we fetched
+        run: docker images
+        if: always()
 
-  deploy:
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+        # FIXME: We ignore for now as now this exits unsuccessfully if there
+        #        are *test* failures
+      - name: Check Report is Valid
+        run: |
+          bowtie summary --show failures ${{ matrix.version }}.json --format markdown >> $GITHUB_STEP_SUMMARY
+        continue-on-error: true
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: report-${{ matrix.version }}
+          path: ${{ matrix.version }}.json
+
+  generate-implementation-metadata:
     runs-on: ubuntu-latest
-    needs: collect
     steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v2
+      - uses: actions/checkout@v6
+
+      - name: Install Bowtie
+        uses: ./
+        with:
+          version: ${{ inputs.bowtie-version }}
+
+      - name: Regenerate data needed by the UI
+        run: |
+          bowtie info $(bowtie filter-implementations | sed 's/^/-i /') --format json > implementations.json
+      - uses: actions/upload-artifact@v5
+        with:
+          name: implementations
+          path: implementations.json
+
+      - name: Regenerate data for our public APIs
+        run: |
+          mkdir -p api/v1/json-schema-org
+          bowtie filter-implementations | \
+            while read -r impl; do
+              bowtie info -i $impl --format json | \
+              jq --arg impl "$impl" --slurpfile dialects data/dialects.json '
+                . as $info |
+                {($info.source): (
+                  {
+                    id: $impl,
+                    dialects: $info.dialects,
+                    badges_urls: (
+                      {
+                        supported_versions: "https://bowtie.report/badges/\($info.language)-\($info.name)/supported_versions.json",
+                        compliance: (
+                          $info.dialects | map(
+                            . as $uri |
+                            $dialects[0] | map(select(.uri == $uri)) | .[0] |
+                            {
+                              (.uri): "https://bowtie.report/badges/\($info.language)-\($info.name)/compliance/\(.shortName).json"
+                            }
+                          ) | add
+                        )
+                      }
+                    )
+                  }
+                )}
+              '
+            done | \
+          jq -s 'add' > api/v1/json-schema-org/implementations
+
+      - name: Validate the public API data against their schema(s)
+        run: |
+          VALIDATION=$(bowtie validate --expect valid -i python-jsonschema bowtie/schemas/api/v1/json-schema-org/implementations.json api/v1/json-schema-org/implementations)
+          echo "$VALIDATION" | bowtie summary --show failures --format markdown >> $GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: api
+          path: api
+
+  site:
+    needs:
+      - regenerate-reports
+      - generate-implementation-metadata
+
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Bowtie
+        uses: ./
+        with:
+          version: ${{ inputs.bowtie-version }}
+
+      - name: Create our Site Structure
+        run: mkdir site
+
+      - name: Include New Reports
+        uses: actions/download-artifact@v6
+        with:
+          pattern: report-*
+          path: site/
+          merge-multiple: true
+
+      - name: Include Benchmark Report from local artifact
+        uses: actions/download-artifact@v6
+        if: inputs.report_benchmark_artifact_in_scope == true
+        with:
+          name: benchmarks
+          path: site/benchmarks
+
+      # if called as a separate workflow
+      - name: Download latest Benchmark Report
+        if: inputs.report_benchmark_artifact_in_scope == false
+        uses: dawidd6/action-download-artifact@v11
+        with:
+          workflow: benchmark.yml
+          branch: main
+          name: benchmarks
+          path: site/benchmarks
+        id: download_benchmark
+        continue-on-error: true
+
+      - name: Fallback for missing benchmarks
+        if: steps.download_benchmark.outcome == 'failure'
+        run: |
+          mkdir -p ./site/benchmarks
+          cd site/benchmarks
+          curl -O https://bowtie.report/benchmarks/draft3.json
+          curl -O https://bowtie.report/benchmarks/draft4.json
+          curl -O https://bowtie.report/benchmarks/draft6.json
+          curl -O https://bowtie.report/benchmarks/draft7.json
+          curl -O https://bowtie.report/benchmarks/draft2019-09.json
+          curl -O https://bowtie.report/benchmarks/draft2020-12.json
+
+      - name: Include our UI data
+        uses: actions/download-artifact@v6
+        with:
+          name: implementations
+          path: site/
+      - name: Include our public API data
+        uses: actions/download-artifact@v6
+        with:
+          name: api
+          path: site/api
+
+      - name: Generate Badges
+        run: bowtie badges
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: site
+          path: site
+
+  redeploy-frontend:
+    permissions:
+      pages: write
+      id-token: write
+    needs: site
+    uses: ./.github/workflows/ui.yml
+    with:
+      report_artifact_in_scope: true

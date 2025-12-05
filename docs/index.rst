@@ -1,31 +1,44 @@
 .. _bowtie:
 
-======
-Bowtie
-======
+=========================
+Bowtie |codespaces-badge|
+=========================
 
-Bowtie is a *meta*-validator of the `JSON Schema specification <https://json-schema.org/>`_, by which we mean it coordinates executing *other* `validator implementations <https://json-schema.org/implementations.html>`_, collecting and reporting on their results.
+Bowtie is a *meta*-validator of the `JSON Schema specification <https://json-schema.org/>`_, by which we mean it coordinates executing *other* `validator implementations <https://json-schema.org/implementations>`_, collecting and reporting on their results.
 
-To do so it defines a simple input/output protocol (specified in `this JSON Schema <https://github.com/bowtie-json-schema/bowtie/blob/main/io-schema.json>`_ which validator implementations can implement, and it provides a CLI which can execute supported implementations.
+It has a few parts:
+
+    * a command line tool which can be used to access any of the |implementation-count| :github:`JSON Schema implementations <orgs/bowtie-json-schema/packages>` integrated with it. Use it to validate any schema and instance against any implementation.
+    * a report, accessible at |site|, showing how well each implementation complies with the specification and which tests they fail (if any)
+    * a protocol which new implementations can integrate with in order to have their implementation be supported by Bowtie
 
 It's called Bowtie because it fans in lots of JSON then fans out lots of results: ``>·<``.
 Looks like a bowtie, no?
 Also because it's elegant – we hope.
 
+If you're just interested in how implementations stack up against each other, you can find the most up to date report at |site|.
 
-Contents
---------
 
 .. toctree::
-    :maxdepth: 1
+  :hidden:
 
-    cli
-    implementers
-    contributing
+  cli
+  github-actions
+  contributing
+  implementers
 
 
 Installation
 ------------
+
+.. sidebar:: Jump Right In!
+
+   You can use Bowtie immediately without installing it!
+
+   :github:`GitHub Codespaces <features/codespaces>` can provide you with an immediate, fully-working cloud environment with Bowtie and all of its supported implementations installed into it:
+
+   |codespaces|
+
 
 Via Homebrew (macOS or Linuxbrew)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -36,17 +49,6 @@ Bowtie is available in a `tap <https://docs.brew.sh/Taps>`_ which is located :gi
 
     brew install bowtie-json-schema/tap/bowtie
 
-As a ``shiv`` / ``pyapp``
-^^^^^^^^^^^^^^^^^^^^^^^^^
-
-There is an experimental `shiv` of Bowtie published to GitHub on each release.
-
-You can find the :gh:`latest one here <releases/latest/>`.
-
-Once downloading it, run ``chmod +x`` on it and you should be able to use it as-is if you have an existing Python installation.
-
-If you use it (successfully or otherwise) please provide feedback.
-
 Manual Installation via PyPI
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
@@ -55,36 +57,13 @@ Bowtie is written in Python, and uses a container runtime to execute JSON Schema
 If you have no previous container runtime installed (e.g. Docker), follow the `installation instructions for podman <https://podman.io/docs/installation>`_ specific to your operating system.
 Ensure you've started a Podman VM if you are on macOS.
 
-Then follow the `pipx installation process <https://pypa.github.io/pipx/installation/>`_ to install ``pipx``, and finally use it to install Bowtie via:
+Then follow the `uv installation process <https://docs.astral.sh/uv/getting-started/installation/>`_ to install ``uv``, and finally use it to run Bowtie via:
 
 .. code:: sh
 
-    pipx install bowtie-json-schema
+    uvx --from bowtie-json-schema bowtie --help
 
-which should give you a working Bowtie installation, which you can check via:
-
-.. code:: sh
-
-    bowtie --help
+which should show you Bowtie's help by invoking its command line interface.
+You can install it so it is runnable via simply ``bowtie`` by using ``uv tool install bowtie-json-schema``.
 
 Further usage details of the command-line interface can be found `here <cli>`.
-
-
-Execution
----------
-
-In general, executing Bowtie consists of providing 2 pieces of input:
-
-    * The names of one or more supported implementations to execute
-    * One or more test cases to run against these implementations (schemas, instances and optionally, expected validation results)
-
-Given these, Bowtie will report on the result of executing each implementation against the input schema/instance pairs.
-If expected results are provided, it will compare the results produced against the expected ones, reporting on any implementations which differ from the expected output.
-
-Uses
-----
-
-A key use of Bowtie is in executing as input the `official test suite`_ and comparing the results produced by implementations to the expected ones from the suite.
-
-Bowtie however isn't limited to just the test cases in the test suite.
-It can be used to compare the validation results of any JSON Schema input across its supported implementations.

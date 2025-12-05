@@ -1,4 +1,0 @@
-file:.#egg=bowtie-json-schema
-pytest
-pytest-asyncio
-pytest-icdiff

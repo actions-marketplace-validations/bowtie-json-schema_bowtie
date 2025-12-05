@@ -63,7 +63,6 @@ func main() {
 				panic("Not version 1!")
 			}
 			data := map[string]interface{}{
-				"ready":   true,
 				"version": 1,
 				"implementation": map[string]interface{}{
 					"language": "go",
@@ -71,6 +70,7 @@ func main() {
 					"version":  gojsonschemaVersion(),
 					"homepage": "https://github.com/xeipuuv/gojsonschema",
 					"issues":   "https://github.com/xeipuuv/gojsonschema/issues",
+					"source":   "https://github.com/xeipuuv/gojsonschema",
 					"dialects": []string{
 						"http://json-schema.org/draft-07/schema#",
 						"http://json-schema.org/draft-06/schema#",

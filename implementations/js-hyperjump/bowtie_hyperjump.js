@@ -1,14 +1,95 @@
 import readline from "readline/promises";
 import os from "os";
 import process from "process";
-import { addSchema, validate } from "@hyperjump/json-schema/draft-2020-12";
-import "@hyperjump/json-schema/draft-2019-09";
-import "@hyperjump/json-schema/draft-07";
-import "@hyperjump/json-schema/draft-06";
-import "@hyperjump/json-schema/draft-04";
-import packageJson from "./node_modules/@hyperjump/json-schema/package.json" assert { type: "json" };
+import { createRequire } from "node:module";
+import * as semver from "semver";
+const packageJson = createRequire(import.meta.url)(
+  "./node_modules/@hyperjump/json-schema/package.json",
+);
 
 const hyperjump_version = packageJson.version;
+
+// versioning setup
+var registerSchemaAndValidate;
+var unregisterSchema;
+var getRetrievalURI;
+
+await (async () => {
+  if (semver.satisfies(hyperjump_version, ">=1.7.0")) {
+    await Promise.all([
+      import("@hyperjump/json-schema/draft-2019-09"),
+      import("@hyperjump/json-schema/draft-07"),
+      import("@hyperjump/json-schema/draft-06"),
+      import("@hyperjump/json-schema/draft-04"),
+    ]);
+    const JsonSchema = await import("@hyperjump/json-schema/draft-2020-12");
+
+    registerSchemaAndValidate = async (testCase, dialect, retrievalURI) => {
+      for (const id in testCase.registry) {
+        const schema = testCase.registry[id];
+        if (!schema.$schema || schema.$schema === dialect) {
+          JsonSchema.registerSchema(schema, id, dialect);
+        }
+      }
+
+      JsonSchema.registerSchema(testCase.schema, retrievalURI, dialect);
+
+      return await JsonSchema.validate(retrievalURI);
+    };
+
+    unregisterSchema = JsonSchema.unregisterSchema;
+    getRetrievalURI = (_, __, args) =>
+      `https://example.com/bowtie-sent-schema-${args.seq.toString()}`;
+  } else {
+    if (semver.satisfies(hyperjump_version, ">=1.0.0")) {
+      await Promise.all([
+        import("@hyperjump/json-schema/draft-2019-09"),
+        import("@hyperjump/json-schema/draft-07"),
+        import("@hyperjump/json-schema/draft-06"),
+        import("@hyperjump/json-schema/draft-04"),
+      ]);
+      const JsonSchema = await import("@hyperjump/json-schema/draft-2020-12");
+
+      registerSchemaAndValidate = async (testCase, dialect, retrievalURI) => {
+        for (const id in testCase.registry) {
+          try {
+            JsonSchema.addSchema(testCase.registry[id], id, dialect);
+          } catch {}
+        }
+
+        JsonSchema.addSchema(testCase.schema, retrievalURI, dialect);
+
+        return await JsonSchema.validate(retrievalURI);
+      };
+    } else if (semver.satisfies(hyperjump_version, ">=0.18.0")) {
+      const JsonSchema = await import("@hyperjump/json-schema");
+
+      registerSchemaAndValidate = async (testCase, dialect, retrievalURI) => {
+        for (const id in testCase.registry) {
+          try {
+            JsonSchema.add(testCase.registry[id], id, dialect);
+          } catch {}
+        }
+
+        JsonSchema.add(testCase.schema, retrievalURI, dialect);
+        const schema = JsonSchema.get(retrievalURI);
+
+        return await JsonSchema.validate(schema);
+      };
+    }
+
+    unregisterSchema = (...args) => {};
+    getRetrievalURI = (testCase, dialect, args) => {
+      const idToken =
+        dialect === "http://json-schema.org/draft-04/schema#" ? "id" : "$id";
+      const host = testCase.schema?.[idToken]?.startsWith("file:")
+        ? "file://"
+        : "https://example.com";
+
+      return `${host}/bowtie.sent.schema.${args.seq.toString()}.json`;
+    };
+  }
+})();
 
 const stdio = readline.createInterface({
   input: process.stdin,
@@ -23,19 +104,13 @@ function send(data) {
 var started = false;
 var dialect = null;
 
-// Skip
+// skip
 const keywordsNotInSchemaMessage =
   "Ignoring schema meta-data keywords in places that are not schemas (such as a $id in a const) is not supported. Because this implementation is dialect agnostic, there's no way to know whether a location is a schema or not. Especially because there's no reason for a schema to use keywords in places that aren't schemas, I'm not concerned about making it work.";
 const keywordsNotInSchemaSkippedTests = [
-  "id inside an enum is not a real identifier",
-  "$id inside an enum is not a real identifier",
-  "$id inside an unknown keyword is not a real identifier",
   "naive replacement of $ref with its destination is not correct",
   "$ref prevents a sibling id from changing the base uri",
   "$ref prevents a sibling $id from changing the base uri",
-  "$anchor inside an enum is not a real identifier",
-  "$anchor inside an enum is not a real identifier",
-  "$id inside an unknown keyword is not a real identifier",
 ].reduce((acc, description) => {
   acc[description] = keywordsNotInSchemaMessage;
   return acc;
@@ -47,10 +122,20 @@ const boundaryCrossingSkippedTests = {
   "base URI change - change folder in subschema": boundaryCrossingMessage,
 };
 
-const modernSkippedTests = { ...keywordsNotInSchemaSkippedTests };
+const fileSchemeMessage =
+  "Self-identifying with a `file:` URI is not allowed for security reasons.";
+const fileSchemeSkippedTests = {
+  "id with file URI still resolves pointers - *nix": fileSchemeMessage,
+  "id with file URI still resolves pointers - windows": fileSchemeMessage,
+  "$id with file URI still resolves pointers - *nix": fileSchemeMessage,
+  "$id with file URI still resolves pointers - windows": fileSchemeMessage,
+};
+
+const modernSkippedTests = { ...fileSchemeSkippedTests };
 const legacySkippedTests = {
   ...boundaryCrossingSkippedTests,
   ...keywordsNotInSchemaSkippedTests,
+  ...fileSchemeSkippedTests,
 };
 
 const dialectSkippedTests = {
@@ -66,14 +151,14 @@ const cmds = {
     console.assert(args.version === 1, { args });
     started = true;
     return {
-      ready: true,
       version: 1,
       implementation: {
         language: "javascript",
-        name: "hyperjump-jsv",
+        name: "hyperjump-json-schema",
         version: hyperjump_version,
         homepage: "https://json-schema.hyperjump.io/",
-        issues: "https://github.com/hyperjump-io/json-schema-validator/issues",
+        issues: "https://github.com/hyperjump-io/json-schema/issues",
+        source: "https://github.com/hyperjump-io/json-schema",
 
         dialects: [
           "https://json-schema.org/draft/2020-12/schema",
@@ -100,12 +185,6 @@ const cmds = {
 
     const testCase = args.case;
 
-    for (const id in testCase.registry) {
-      try {
-        addSchema(testCase.registry[id], id, dialect);
-      } catch {}
-    }
-
     let results;
     if (testCase.description in dialectSkippedTests[dialect]) {
       results = testCase.tests.map((_) => {
@@ -115,26 +194,43 @@ const cmds = {
         };
       });
     } else {
+      const retrievalURI = getRetrievalURI(testCase, dialect, args);
+
       try {
-        const fakeURI =
-          "https://example.com/bowtie.sent.schema." +
-          args.seq.toString() +
-          ".json";
-        addSchema(testCase.schema, fakeURI, dialect);
-        const _validate = await validate(fakeURI);
+        const _validate = await registerSchemaAndValidate(
+          testCase,
+          dialect,
+          retrievalURI,
+        );
+
         results = testCase.tests.map((test) => {
           try {
             const result = _validate(test.instance);
             return { valid: result.valid };
           } catch (error) {
-            return { errored: true, context: { message: error.message } };
+            return {
+              errored: true,
+              context: {
+                traceback: error.stack,
+                message: error.message,
+              },
+            };
           }
         });
       } catch (error) {
         results = testCase.tests.map((_) => ({
           errored: true,
-          context: { message: error.message },
+          context: {
+            traceback: error.stack,
+            message: error.message,
+          },
         }));
+      } finally {
+        unregisterSchema(retrievalURI);
+
+        for (const id in testCase.registry) {
+          unregisterSchema(id);
+        }
       }
     }
 

@@ -1,430 +1,444 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, TextIO, TypedDict
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, TypedDict
 import importlib.metadata
 import json
 import sys
 
-from attrs import asdict, field, frozen, mutable
+from attrs import asdict, field, frozen
+from attrs.filters import exclude
+from rpds import HashTrieMap
+from url import URL
 import structlog.stdlib
 
-from bowtie import _commands
+from bowtie._commands import Seq, SeqCase, SeqResult, Unsuccessful
+from bowtie._core import Dialect, TestCase, sortable_version_key
+from bowtie._direct_connectable import Direct
 
 if TYPE_CHECKING:
-    from bowtie._core import Implementation
+    from collections.abc import Callable, Iterable, Mapping
+    from typing import Any, Literal, Self, TextIO
+
+    from bowtie._commands import AnyTestResult
+    from bowtie._connectables import ConnectableId
+    from bowtie._core import Example, ImplementationInfo, Test
 
 
-class _InvalidBowtieReport(Exception):
-    pass
+class InvalidReport(Exception):
+    """
+    The report is invalid.
+    """
 
 
-_DIALECT_URI_TO_SHORTNAME = {
-    "https://json-schema.org/draft/2020-12/schema": "Draft 2020-12",
-    "https://json-schema.org/draft/2019-09/schema": "Draft 2019-09",
-    "http://json-schema.org/draft-07/schema#": "Draft 7",
-    "http://json-schema.org/draft-06/schema#": "Draft 6",
-    "http://json-schema.org/draft-04/schema#": "Draft 4",
-    "http://json-schema.org/draft-03/schema#": "Draft 3",
-}
+class EmptyReport(InvalidReport):
+    """
+    The report was totally empty.
+    """
+
+
+class DuplicateCase(InvalidReport):
+    """
+    A `Seq` appeared twice in the report.
+    """
+
+
+class MissingFooter(InvalidReport):
+    """
+    A report is missing its footer.
+
+    Even though that only tells us whether the report failed fast, it might
+    mean there's actual data missing too.
+    """
 
 
 def writer(file: TextIO = sys.stdout) -> Callable[..., Any]:
-    return lambda **result: file.write(f"{json.dumps(result)}\n")
+    return lambda **result: file.write(f"{json.dumps(result)}\n")  # type: ignore[reportUnknownArgumentType]
 
 
 @frozen
 class Reporter:
-    _write: Callable[..., Any] = field(default=writer())
+    _write: Callable[..., Any] = field(default=writer(), alias="write")
     _log: structlog.stdlib.BoundLogger = field(
         factory=structlog.stdlib.get_logger,
     )
 
-    def unsupported_dialect(
-        self,
-        implementation: Implementation,
-        dialect: str,
-    ):
-        self._log.warn(
-            "Unsupported dialect, skipping implementation.",
-            logger_name=implementation.name,
-            dialect=dialect,
-        )
-
-    def unacknowledged_dialect(
+    def schema_without_dialect(
         self,
         implementation: str,
-        dialect: str,
-        response: Any,
+        dialect: Dialect,
+        schema: Any,
     ):
         self._log.warn(
             (
-                "Implicit dialect not acknowledged. "
-                "Proceeding, but implementation may not have configured "
-                "itself to handle schemas without $schema."
+                f"The schema {schema!r} does not indicate its dialect via "
+                "the $schema keyword. "
+                f"This implementation does not support external dialect "
+                "configuration, so validation results may not properly "
+                "take the current dialect into account."
             ),
             logger_name=implementation,
-            dialect=dialect,
-            response=response,
+            dialect=dialect.pretty_name,
         )
 
-    def ready(self, run_info: RunInfo):
-        self._write(
-            **{k.lstrip("_"): v for k, v in asdict(run_info).items()},
-        )
+    def ready(self, run_metadata: RunMetadata):
+        self._log.debug("Will speak", dialect=run_metadata.dialect)
+        self._write(**run_metadata.serializable())
 
-    def will_speak(self, dialect: str):
-        self._log.info("Will speak", dialect=dialect)
-
-    def finished(self, count: int, did_fail_fast: bool):
-        if not count:
-            self._log.error("No test cases ran.")
-        else:
-            self._log.info("Finished", count=count)
+    def finished(self, did_fail_fast: bool):
         self._write(did_fail_fast=did_fail_fast)
 
-    def no_such_image(self, name: str):
-        self._log.error("Not a known Bowtie implementation.", logger_name=name)
-
-    def startup_failed(self, name: str, stderr: str):
-        self._log.exception(
-            "Startup failed!",
-            logger_name=name,
-            **{"stderr": stderr} if stderr else {},
+    def case_started(self, seq_case: SeqCase, dialect: Dialect):
+        self._write(**seq_case.serializable())
+        log = self._log.bind(
+            case=seq_case.case.description,
+            schema=seq_case.case.schema,
         )
 
-    def dialect_error(self, implementation: Implementation, stderr: str):
-        self._log.error(
-            "Tried to start sending test cases, but got an error.",
-            logger_name=implementation.name,
-            stderr=stderr,
-        )
+        if not seq_case.matches_dialect(dialect):
+            log.warning(
+                "$schema keyword does not seem to match the expected dialect",
+                expected=dialect,
+            )
 
-    def no_implementations(self):
-        self._log.error("No implementations started successfully!")
+        def got_result(result: SeqResult):
+            bound = log.bind(logger_name=result.implementation)
+            serialized = result.log_and_be_serialized(log=bound)
+            self._write(**serialized)
 
-    def invalid_response(
-        self,
-        cmd: _commands.Command[Any],
-        response: bytes,
-        implementation: Implementation,
-        error: Exception,
-    ):
-        self._log.exception(
-            "Invalid response",
-            logger_name=implementation.name,
-            exc_info=error,
-            request=cmd,
-        )
-
-    def case_started(self, seq: int, case: _commands.TestCase):
-        return _CaseReporter.case_started(
-            case=case,
-            seq=seq,
-            write=self._write,
-            log=self._log.bind(
-                seq=seq,
-                case=case.description,
-                schema=case.schema,
-            ),
-        )
+        return got_result
 
 
 @frozen
-class _CaseReporter:
-    _write: Callable[..., Any] = field(alias="write")
-    _log: structlog.stdlib.BoundLogger = field(alias="log")
-
-    @classmethod
-    def case_started(
-        cls,
-        log: structlog.stdlib.BoundLogger,
-        write: Callable[..., None],
-        case: _commands.TestCase,
-        seq: int,
-    ) -> _CaseReporter:
-        self = cls(log=log, write=write)
-        self._write(case=asdict(case), seq=seq)
-        return self
-
-    def got_results(
-        self,
-        results: _commands.CaseResult | _commands.CaseErrored,
-    ):
-        self._write(**asdict(results))
-
-    def skipped(self, skipped: _commands.CaseSkipped):
-        self._write(**asdict(skipped))
-
-    def no_response(self, implementation: str):
-        self._log.error("No response", logger_name=implementation)
-
-    def errored(self, results: _commands.CaseErrored):
-        implementation, context = results.implementation, results.context
-        message = "" if results.caught else "uncaught error"
-        self._log.error(message, logger_name=implementation, **context)
-        self.got_results(results)
-
-
-@mutable
-class Count:
-    total_cases: int = 0
-    errored_cases: int = 0
-
-    total_tests: int = 0
-    failed_tests: int = 0
-    errored_tests: int = 0
-    skipped_tests: int = 0
-
-    @property
-    def unsuccessful_tests(self):
-        """
-        Any test which was not a successful result, including skips.
-        """
-        return self.errored_tests + self.failed_tests + self.skipped_tests
-
-
-@mutable
-class _Summary:
-    implementations: Iterable[dict[str, Any]] = field(
-        converter=lambda value: sorted(  # type: ignore[reportUnknownArgumentType]  # noqa: E501
-            value,  # type: ignore[reportUnknownArgumentType]
-            key=lambda each: (each["language"], each["name"]),  # type: ignore[reportUnknownArgumentType]  # noqa: E501
+class RunMetadata:
+    dialect: Dialect
+    implementations: Mapping[ConnectableId, ImplementationInfo] = field(
+        repr=lambda value: (
+            f"({len(value)} implementation{'s' if len(value) != 1 else ''})"
         ),
-    )
-    _combined: dict[int, Any] = field(factory=dict)
-    did_fail_fast: bool = False
-    counts: dict[str, Count] = field(init=False)
-
-    def __attrs_post_init__(self) -> None:
-        self.counts = {each["image"]: Count() for each in self.implementations}
-
-    @property
-    def total_cases(self):
-        counts = {count.total_cases for count in self.counts.values()}
-        if len(counts) != 1:
-            summary = "  \n".join(
-                f"  {each.rpartition('/')[2]}: {count.total_cases}"
-                for each, count in self.counts.items()
-            )
-            raise _InvalidBowtieReport(
-                f"Inconsistent number of cases run:\n\n{summary}",
-            )
-        return counts.pop()
-
-    @property
-    def errored_cases(self):
-        return sum(count.errored_cases for count in self.counts.values())
-
-    @property
-    def total_tests(self):
-        counts = {count.total_tests for count in self.counts.values()}
-        if len(counts) != 1:
-            raise _InvalidBowtieReport(
-                f"Inconsistent number of tests run: {self.counts}",
-            )
-        return counts.pop()
-
-    @property
-    def failed_tests(self):
-        return sum(count.failed_tests for count in self.counts.values())
-
-    @property
-    def errored_tests(self):
-        return sum(count.errored_tests for count in self.counts.values())
-
-    @property
-    def skipped_tests(self):
-        return sum(count.skipped_tests for count in self.counts.values())
-
-    def add_case_metadata(self, seq: int, case: dict[str, Any]):
-        results: list[tuple[Any, dict[str, tuple[str, str]]]] = [
-            (test, {}) for test in case["tests"]
-        ]
-        self._combined[seq] = dict(case=case, results=results)
-
-    def see_error(
-        self,
-        implementation: str,
-        seq: int,
-        context: dict[str, Any],
-        caught: bool,
-    ):
-        count = self.counts[implementation]
-        count.total_cases += 1
-        count.errored_cases += 1
-
-        case = self._combined[seq]["case"]
-        count.total_tests += len(case["tests"])
-        count.errored_tests += len(case["tests"])
-
-    def see_result(self, result: _commands.CaseResult):
-        count = self.counts[result.implementation]
-        count.total_cases += 1
-
-        combined = self._combined[result.seq]["results"]
-
-        for (test, failed), (_, seen) in zip(result.compare(), combined):
-            count.total_tests += 1
-            if test.skipped:
-                count.skipped_tests += 1
-                seen[result.implementation] = test.reason, "skipped"  # type: ignore[reportGeneralTypeIssues]  # noqa: E501
-            elif test.errored:
-                count.errored_tests += 1
-                seen[result.implementation] = test.reason, "errored"  # type: ignore[reportGeneralTypeIssues]  # noqa: E501
-            else:
-                if failed:
-                    count.failed_tests += 1
-                seen[result.implementation] = test, failed
-
-    def see_skip(self, skipped: _commands.CaseSkipped):
-        count = self.counts[skipped.implementation]
-        count.total_cases += 1
-
-        case = self._combined[skipped.seq]["case"]
-        count.total_tests += len(case["tests"])
-        count.skipped_tests += len(case["tests"])
-
-        for _, seen in self._combined[skipped.seq]["results"]:
-            message = skipped.issue_url or skipped.message or "skipped"
-            seen[skipped.implementation] = message, "skipped"
-
-    def see_maybe_fail_fast(self, did_fail_fast: bool):
-        self.did_fail_fast = did_fail_fast
-
-    def case_results(self):
-        return (
-            (each["case"], each.get("registry", {}), each["results"])
-            for each in self._combined.values()
-        )
-
-    def flat_results(self):
-        for seq, each in sorted(self._combined.items()):
-            case = each["case"]
-            yield (
-                seq,
-                case["description"],
-                case["schema"],
-                case["registry"],
-                each["results"],
-            )
-
-    def generate_badges(self, target_dir: Path, dialect: str):
-        label = _DIALECT_URI_TO_SHORTNAME[dialect]
-        for impl in self.implementations:
-            dialect_versions = impl["dialects"]
-            if dialect not in dialect_versions:
-                continue
-            supported_drafts = ", ".join(
-                _DIALECT_URI_TO_SHORTNAME[each].removeprefix("Draft ")
-                for each in reversed(dialect_versions)
-            )
-            name = impl["name"]
-            lang = impl["language"]
-            counts = self.counts[impl["image"]]
-            total = counts.total_tests
-            passed = (
-                total
-                - counts.failed_tests
-                - counts.errored_tests
-                - counts.skipped_tests
-            )
-            pct = (passed / total) * 100
-            r, g, b = 100 - int(pct), int(pct), 0
-            badge_per_draft = {
-                "schemaVersion": 1,
-                "label": label,
-                "message": "%d%% Passing" % int(pct),
-                "color": f"{r:02x}{g:02x}{b:02x}",
-            }
-            comp_dir = target_dir / f"{lang}-{name}" / "compliance"
-            comp_dir.mkdir(parents=True, exist_ok=True)
-            badge_path_per_draft = comp_dir / f"{label.replace(' ', '_')}.json"
-            badge_path_per_draft.write_text(json.dumps(badge_per_draft))
-            badge_supp_draft = {
-                "schemaVersion": 1,
-                "label": "JSON Schema Versions",
-                "message": supported_drafts,
-                "color": "lightgreen",
-            }
-            supp_dir = target_dir / f"{lang}-{name}"
-            badge_path_supp_drafts = supp_dir / "supported_versions.json"
-            badge_path_supp_drafts.write_text(json.dumps(badge_supp_draft))
-
-
-@frozen
-class RunInfo:
-    started: str
-    bowtie_version: str
-    dialect: str
-    _implementations: dict[str, dict[str, Any]] = field(
         alias="implementations",
     )
-    metadata: dict[str, Any] = field(factory=dict)
-
-    @property
-    def dialect_shortname(self):
-        return _DIALECT_URI_TO_SHORTNAME.get(self.dialect, self.dialect)
+    bowtie_version: str = field(
+        default=importlib.metadata.version("bowtie-json-schema"),
+        eq=False,
+        repr=False,
+    )
+    metadata: Mapping[str, Any] = field(factory=dict, repr=False)  # type: ignore[reportUnknownVariableType]
+    started: datetime = field(
+        factory=lambda: datetime.now(UTC),
+        eq=False,
+        repr=False,
+    )
 
     @classmethod
-    def from_implementations(
+    def from_dict(
         cls,
-        implementations: Iterable[Implementation],
+        dialect: str,
+        implementations: dict[str, dict[str, Any]],
+        started: str | None = None,
         **kwargs: Any,
-    ) -> RunInfo:
+    ) -> RunMetadata:
+        from bowtie._core import ImplementationInfo  # noqa: PLC0415
+
+        if started is not None:
+            kwargs["started"] = datetime.fromisoformat(started)
         return cls(
-            bowtie_version=importlib.metadata.version("bowtie-json-schema"),
-            started=datetime.now(timezone.utc).isoformat(),
+            dialect=Dialect.from_str(dialect),
             implementations={
-                implementation.name: dict(
-                    implementation.metadata or {},
-                    image=implementation.name,
-                )
-                for implementation in implementations
+                id: ImplementationInfo.from_dict(**data)
+                for id, data in implementations.items()
             },
             **kwargs,
         )
 
-    def create_summary(self) -> _Summary:
-        """
-        Create a summary object used to incrementally parse reports.
-        """
-        return _Summary(implementations=self._implementations.values())
+    def serializable(self):
+        as_dict = asdict(
+            self,
+            filter=exclude("dialect"),
+            recurse=False,
+        )
+        as_dict.update(
+            dialect=self.dialect.serializable(),
+            started=as_dict.pop("started").isoformat(),
+            # FIXME: This transformation is to support the UI parsing
+            implementations={
+                id: implementation.serializable()
+                for id, implementation in self.implementations.items()
+            },
+        )
+        return as_dict
 
 
-class ReportData(TypedDict):
-    summary: _Summary
-    run_info: RunInfo
-    generate_dialect_navigation: bool
+@frozen(eq=False)
+class Report:  # noqa: PLW1641
+    r"""
+    A Bowtie report, containing (amongst other things) results about cases run.
 
+    In general, reports are assumed to be constructed by calling
+    `Report.from_serialized` or an equivalent (i.e. by 'replaying' JSON output
+    that was produced by Bowtie).
 
-def from_input(
-    input: Iterable[str],
-    generate_dialect_navigation: bool = False,
-) -> ReportData:
+    When comparing reports (e.g. for equality), only the relative order of
+    test cases is considered, not the exact `Seq`\ s used in the run.
     """
-    Create a structure suitable for the report template from an input file.
-    """
-    lines = (json.loads(line) for line in input)
-    run_info = RunInfo(**next(lines))
-    summary = run_info.create_summary()
 
-    for each in lines:
-        if "case" in each:
-            summary.add_case_metadata(**each)
-        elif "caught" in each:
-            summary.see_error(**each)
-        elif "skipped" in each:
-            del each["skipped"]
-            summary.see_skip(_commands.CaseSkipped(**each))
-        elif "did_fail_fast" in each:
-            summary.see_maybe_fail_fast(**each)
-        else:
-            summary.see_result(_commands.CaseResult.from_dict(each))
-    return ReportData(
-        summary=summary,
-        run_info=run_info,
-        generate_dialect_navigation=generate_dialect_navigation,
+    _cases: HashTrieMap[Seq, TestCase] = field(alias="cases", repr=False)
+    _results: HashTrieMap[
+        ConnectableId,
+        HashTrieMap[Seq, SeqResult],
+    ] = field(
+        repr=False,
+        alias="results",
+    )
+    metadata: RunMetadata
+    did_fail_fast: bool
+
+    def __eq__(self, other: object):
+        if type(other) is not Report:
+            return NotImplemented
+
+        if (  # short circuit for fewer/more cases or differing implementations
+            len(self._cases) != len(other._cases)
+            or self._results.keys() != other._results.keys()
+        ):
+            return False
+
+        this, that = asdict(self, recurse=False), asdict(other, recurse=False)
+
+        cases = [v for _, v in sorted(this.pop("_cases").items())]
+        if cases != [v for _, v in sorted(that.pop("_cases").items())]:
+            return False
+
+        other_results = that.pop("_results")
+        for name, results in this.pop("_results").items():
+            ordered = [v for _, v in sorted(results.items())]
+            if ordered != [v for _, v in sorted(other_results[name].items())]:
+                return False
+        return this == that
+
+    @classmethod
+    def from_input(cls, input: Iterable[Mapping[str, Any]]) -> Self:
+        # TODO: Support some interface for enabling/disabling validation.
+        validator = (
+            Direct.from_id("python-jsonschema")
+            .registry()
+            .for_uri(
+                URL.parse("tag:bowtie.report,2024:report"),
+            )
+        )
+
+        iterator = iter(input)
+        header = next(iterator, None)
+        if header is None:
+            raise EmptyReport()
+        metadata = RunMetadata.from_dict(**validator.validated(header))
+
+        results: HashTrieMap[  # type: ignore[reportUnknownVariableType] # pyright cannot infer the type returned by HashTrieMap.fromkeys
+            ConnectableId,
+            HashTrieMap[Seq, SeqResult],
+        ] = HashTrieMap.fromkeys(  # type: ignore[reportUnknownMemberType]
+            metadata.implementations,
+            HashTrieMap(),
+        )
+        cases: HashTrieMap[Seq, TestCase] = HashTrieMap()
+
+        for data in iterator:
+            match validator.validated(data):
+                case {"seq": seq, "case": case}:
+                    if seq in cases:
+                        raise DuplicateCase(seq)
+                    case = TestCase.from_dict(dialect=metadata.dialect, **case)
+                    cases = cases.insert(seq, case)
+                    continue
+                case {"did_fail_fast": did_fail_fast}:
+                    return cls(
+                        results=results,
+                        cases=cases,
+                        metadata=metadata,
+                        did_fail_fast=did_fail_fast,
+                    )
+                case _:
+                    result = SeqResult.from_dict(**data)
+
+            current = results.get(result.implementation, HashTrieMap())
+            results = results.insert(  # TODO: Complain if present
+                result.implementation,
+                current.insert(result.seq, result),
+            )
+
+        raise MissingFooter()
+
+    @classmethod
+    def from_serialized(cls, serialized: Iterable[str]) -> Self:
+        return cls.from_input(json.loads(line) for line in serialized)
+
+    @classmethod
+    def empty(
+        cls,
+        implementations: Mapping[ConnectableId, ImplementationInfo] = {},
+        **kwargs: Any,
+    ):
+        """
+        'The' empty report.
+        """
+        return cls(
+            cases=HashTrieMap(),
+            results=HashTrieMap(),
+            metadata=RunMetadata(implementations=implementations, **kwargs),
+            did_fail_fast=False,
+        )
+
+    @classmethod
+    def combine_versioned_reports_for(
+        cls,
+        versioned_reports: Iterable[Report],
+        dialect: Dialect,
+    ) -> Report:
+        versioned_reports = [
+            versioned_report
+            for versioned_report in versioned_reports
+            if versioned_report.metadata.dialect == dialect
+            and not versioned_report.is_empty
+        ]
+        if not versioned_reports:
+            return cls.empty(dialect=dialect)
+
+        results: HashTrieMap[
+            ConnectableId,
+            HashTrieMap[Seq, SeqResult],
+        ] = HashTrieMap()
+        implementations: dict[ConnectableId, ImplementationInfo] = {}
+
+        for versioned_report in versioned_reports:
+            ((version_id, version_info),) = (
+                versioned_report.metadata.implementations.items()
+            )
+            implementations[version_id] = version_info
+            results = results.insert(
+                version_id,
+                versioned_report._results[version_id],
+            )
+
+        return cls(
+            cases=versioned_reports[0]._cases,
+            results=results,
+            metadata=RunMetadata(
+                implementations=implementations,
+                dialect=dialect,
+            ),
+            did_fail_fast=False,
+        )
+
+    @property
+    def implementations(self) -> Mapping[ConnectableId, ImplementationInfo]:
+        return self.metadata.implementations
+
+    @property
+    def is_empty(self):
+        return not self._cases
+
+    @property
+    def total_tests(self):
+        return sum(len(case.tests) for case in self._cases.values())
+
+    def compliance_by_implementation(self):
+        """
+        Return the fraction of passing tests for each reported implementation.
+        """
+        return {
+            id: 1 - (unsuccessful.total / self.total_tests)
+            for id, _, unsuccessful in self.worst_to_best()
+        }
+
+    def unsuccessful(self, implementation: ConnectableId) -> Unsuccessful:
+        """
+        A count of the unsuccessful tests for the given implementation.
+        """
+        results = self._results[implementation].values()
+        return sum((each.unsuccessful() for each in results), Unsuccessful())
+
+    def worst_to_best(self):
+        """
+        All implementations ordered by number of unsuccessful tests.
+
+        Ties are then broken alphabetically.
+        """
+        unsuccessful = [
+            (id, implementation, self.unsuccessful(id))
+            for id, implementation in self.implementations.items()
+        ]
+        unsuccessful.sort(key=lambda each: (each[2].total, each[1].name))
+        return unsuccessful
+
+    def latest_to_oldest(self):
+        """
+        Versioned implementations sorted by their latest to oldest versions.
+        """
+        unsuccessful = [
+            (implementation.version, self.unsuccessful(id))
+            for id, implementation in self.implementations.items()
+            if implementation.version is not None
+        ]
+        unsuccessful.sort(
+            key=lambda version_compliance: (
+                sortable_version_key(version_compliance[0])
+            ),
+            reverse=True,
+        )
+        return unsuccessful
+
+    def cases_with_results(
+        self,
+    ) -> Iterable[
+        tuple[
+            TestCase,
+            Iterable[tuple[Example | Test, Mapping[str, AnyTestResult]]],
+        ]
+    ]:
+        for seq, case in sorted(self._cases.items()):
+            test_results: list[
+                tuple[Example | Test, Mapping[str, AnyTestResult]]
+            ] = []
+            for i, test in enumerate(case.tests):
+                test_result = {
+                    id: self._results[id][seq].result_for(i)
+                    for id in self.implementations
+                }
+                test_results.append((test, test_result))
+            yield case, test_results
+
+    def compliance_badges(self) -> Iterable[tuple[ImplementationInfo, Badge]]:
+        for id, implementation in self.implementations.items():
+            unsuccessful = self.unsuccessful(id)
+            passed = self.total_tests - unsuccessful.total
+            percentage = int(100 * (passed / self.total_tests))
+            r, g, b = 100 - percentage, percentage, 0
+            yield (
+                implementation,
+                Badge(
+                    schemaVersion=1,
+                    label=self.metadata.dialect.pretty_name,
+                    message=f"{percentage}% Passing",
+                    color=f"{r:02x}{g:02x}{b:02x}",
+                ),
+            )
+
+
+class Badge(TypedDict):
+    schemaVersion: Literal[1]
+    label: str
+    message: str
+    color: str
+
+
+def supported_version_badge(dialects: Iterable[Dialect]) -> Badge:
+    message = ", ".join(
+        each.pretty_name.removeprefix("Draft ")
+        for each in sorted(dialects, reverse=True)
+    )
+    return Badge(
+        schemaVersion=1,
+        label="JSON Schema Versions",
+        message=message,
+        color="lightgreen",
     )

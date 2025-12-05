@@ -1,357 +1,1094 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Iterable
+from collections import Counter
+from collections.abc import Callable, Iterable
 from contextlib import AsyncExitStack, asynccontextmanager
 from fnmatch import fnmatch
-from io import BytesIO
+from functools import wraps
+from io import TextIOWrapper
 from pathlib import Path
-from typing import Any, AsyncIterator, TextIO, Union
-from urllib.parse import urljoin
+from pprint import pformat
+from statistics import mean, median, quantiles
+from textwrap import dedent
+from time import perf_counter_ns
+from typing import IO, TYPE_CHECKING, Any, Literal, Protocol, cast
 import asyncio
 import json
+import logging
 import os
 import sys
-import zipfile
+import tarfile
 
-from attrs import asdict
+from click.shell_completion import CompletionItem
+from diagnostic import DiagnosticError
+from inflect import engine as InflectEngine
 from rich import box, console, panel
+from rich.progress import (
+    BarColumn,
+    DownloadColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
 from rich.table import Column, Table
 from rich.text import Text
-import aiodocker
-import click
-import jinja2
+from rich_click.utils import CommandGroupDict, OptionGroupDict
+from url import URL, RelativeURLWithoutBase
+import httpx
+import rich_click as click
 import structlog
 import structlog.typing
 
-from bowtie import _report
-from bowtie._commands import ReportableResult, Test, TestCase
+from bowtie import DOCS, HOMEPAGE, _benchmarks, _connectables, _report, _suite
+from bowtie._commands import SeqCase, TestResult, Unsuccessful
 from bowtie._core import (
-    DialectRunner,
-    GotStderr,
+    Dialect,
+    Example,
     Implementation,
-    NoSuchImage,
-    StartupFailed,
+    Test,
+    TestCase,
+    convert_table_to_markdown,
 )
+from bowtie._direct_connectable import Direct
 from bowtie.exceptions import (
-    _ProtocolError,  # type: ignore[reportPrivateUsage]
+    CannotConnect,
+    DialectError,
+    NoSuchImplementation,
+    StartupFailed,
+    UnsupportedDialect,
 )
 
-try:
-    from importlib.resources import files
-except ImportError:
-    from importlib_resources import files  # type: ignore
+if TYPE_CHECKING:
+    from collections.abc import (
+        AsyncIterator,
+        Awaitable,
+        Mapping,
+        Sequence,
+        Set,
+    )
+    from os import PathLike
+    from typing import TextIO
 
-IMAGE_REPOSITORY = "ghcr.io/bowtie-json-schema"
-TEST_SUITE_URL = "https://github.com/json-schema-org/json-schema-test-suite"
+    from click.decorators import FC
+    from httpx import Response
+    from referencing.jsonschema import SchemaResource
 
-DRAFT2020 = "https://json-schema.org/draft/2020-12/schema"
-DRAFT2019 = "https://json-schema.org/draft/2019-09/schema"
-DRAFT7 = "http://json-schema.org/draft-07/schema#"
-DRAFT6 = "http://json-schema.org/draft-06/schema#"
-DRAFT4 = "http://json-schema.org/draft-04/schema#"
-DRAFT3 = "http://json-schema.org/draft-03/schema#"
+    from bowtie._commands import AnyTestResult, SeqResult
+    from bowtie._connectables import Connectable, ConnectableId
+    from bowtie._core import DialectRunner, ImplementationInfo
+    from bowtie._registry import ValidatorRegistry
 
-DIALECT_SHORTNAMES = {
-    "2020": DRAFT2020,
-    "202012": DRAFT2020,
-    "2020-12": DRAFT2020,
-    "draft2020-12": DRAFT2020,
-    "draft202012": DRAFT2020,
-    "2019": DRAFT2019,
-    "201909": DRAFT2019,
-    "2019-09": DRAFT2019,
-    "draft2019-09": DRAFT2019,
-    "draft201909": DRAFT2019,
-    "7": DRAFT7,
-    "draft7": DRAFT7,
-    "6": DRAFT6,
-    "draft6": DRAFT6,
-    "4": DRAFT4,
-    "draft4": DRAFT4,
-    "3": DRAFT3,
-    "draft3": DRAFT3,
+
+class _EX:
+    def __getattr__(self, attr: str) -> int:
+        return getattr(os, f"EX_{attr}", 1)  # Windows fallbacks...
+
+
+EX = _EX()
+
+STDOUT = console.Console()
+STDERR = console.Console(stderr=True)
+
+STARTUP_ERRORS = (CannotConnect, NoSuchImplementation, StartupFailed)
+
+
+# rich-click's CommandGroupDict seems to be missing some covariance,
+# as using a regular dict here makes pyright complain.
+_COMMAND_GROUPS = {
+    "bowtie": [
+        CommandGroupDict(
+            name="Basic Commands",
+            commands=["validate", "suite", "summary", "info"],
+        ),
+        CommandGroupDict(
+            name="Advanced Usage",
+            commands=[
+                "filter-dialects",
+                "filter-implementations",
+                "latest-report",
+                "run",
+                "statistics",
+                "trend",
+            ],
+        ),
+        CommandGroupDict(
+            name="Plumbing Commands",
+            commands=["badges", "smoke"],
+        ),
+        CommandGroupDict(
+            name="Benchmarking Commands",
+            commands=["perf", "filter-benchmarks"],
+        ),
+    ],
 }
-LATEST_DIALECT_NAME = "draft2020-12"
+_OPTION_GROUPS = {
+    f"bowtie {command}": [
+        *[
+            OptionGroupDict(name=group, options=[f"--{o}" for o in options])
+            for group, options in groups
+        ],
+        OptionGroupDict(
+            name="Connection & Communication Options",
+            options=["--read-timeout", "--validate-implementations"],
+        ),
+        OptionGroupDict(name="Help", options=["--help"]),
+    ]
+    for command, groups in [
+        (
+            "validate",
+            [
+                ("Required", ["implementation"]),
+                ("Schema Behavior Options", ["dialect", "set-schema"]),
+                ("Validation Metadata Options", ["description", "expect"]),
+            ],
+        ),
+        (
+            "suite",
+            [
+                ("Required", ["implementation"]),
+                (
+                    "Test Run Options",
+                    ["fail-fast", "filter", "max-error", "max-fail"],
+                ),
+                ("Test Modification Options", ["set-schema"]),
+            ],
+        ),
+        ("info", [("Basic Options", ["implementation", "format"])]),
+        ("smoke", [("Basic Options", ["implementation", "quiet", "format"])]),
+        (
+            "filter-dialects",
+            [
+                ("Required", ["implementation"]),
+                ("Filters", ["dialect", "latest", "boolean-schemas"]),
+            ],
+        ),
+        (
+            "filter-implementations",
+            [
+                (
+                    "Filters",
+                    [
+                        "supports-dialect",
+                        "language",
+                        "direct",
+                        "implementation",
+                    ],
+                ),
+            ],
+        ),
+        (
+            "run",
+            [
+                ("Required", ["implementation"]),
+                ("Schema Behavior Options", ["dialect", "set-schema"]),
+                (
+                    "Test Run Options",
+                    ["fail-fast", "filter", "max-error", "max-fail"],
+                ),
+            ],
+        ),
+        (
+            "perf",
+            [
+                ("Required", ["implementation"]),
+                (
+                    "Benchmark Configuration Options",
+                    [
+                        "benchmark-file",
+                        "dialect",
+                        "keywords",
+                        "loops",
+                        "runs",
+                        "test-suite",
+                        "values",
+                        "warmups",
+                    ],
+                ),
+                (
+                    "Basic Options",
+                    ["format", "max-fail", "quiet"],
+                ),
+            ],
+        ),
+    ]
+}
 
-#: Should match the magic value used to validate `schema`s in `io-schema.json`
-CURRENT_DIALECT_URI = "urn:current-dialect"
 
-FORMAT = click.option(
-    "--format",
-    "-f",
-    "format",
-    help="What format to use for the output",
-    default=lambda: "pretty" if sys.stdout.isatty() else "json",
-    show_default="pretty if stdout is a tty, otherwise JSON",
-    type=click.Choice(["json", "pretty"]),
+@click.rich_config(
+    help_config=click.RichHelpConfiguration(
+        command_groups=_COMMAND_GROUPS,
+        option_groups=_OPTION_GROUPS,
+        style_commands_table_column_width_ratio=(1, 3),
+        # Otherwise there's an uncomfortable amount of internal whitespace.
+        max_width=120,
+    ),
 )
+@click.group(
+    context_settings=dict(help_option_names=["--help", "-h"]),
+    # needing to explicitly dedent here, as well as the extra newline
+    # before "Full documentation" both seem like rich-click bugs.
+    epilog=dedent(
+        f"""
+        If you don't know where to begin, `bowtie validate --help` or
+        `bowtie suite --help` are likely good places to start.
 
-
-@click.group(context_settings=dict(help_option_names=["--help", "-h"]))
+        Full documentation can also be found at {DOCS}
+        """,
+    ),
+)
 @click.version_option(prog_name="bowtie", package_name="bowtie-json-schema")
-def main():
+@click.option(
+    "--log-level",
+    "-L",
+    help="How verbose should Bowtie be?",
+    default="warning",
+    show_default="warning",
+    type=click.Choice(
+        [
+            "debug",
+            "info",
+            "warning",
+            "error",
+            "critical",
+        ],
+    ),
+)
+def main(log_level: str):
     """
     A meta-validator for the JSON Schema specifications.
+
+    Bowtie gives you access to the JSON Schema ecosystem across every
+    programming language and implementation.
+
+    It lets you compare implementations either to each other or to known
+    correct results from the official JSON Schema test suite.
     """
-    redirect_structlog()
+    _redirect_structlog(log_level=getattr(logging, log_level.upper()))
 
 
-@main.command()
-@click.argument(
-    "input",
-    default="-",
-    type=click.File(mode="r"),
-)
-@click.option(
-    "--out",
-    "-o",
-    "output",
-    help="Where to write the outputted report HTML.",
-    default="bowtie-report.html",
-    show_default=True,
-    type=click.File("w"),
-)
-@click.option(
-    "--badges",
-    "-b",
-    help="Directory to write the generated badge json files.",
-    type=click.Path(path_type=Path),
-)
-@click.option(
-    "--generate-dialect-navigation",
-    help="generate hyperlinks to all dialect reports",
-    is_flag=True,
-    default=False,
-)
-def report(
-    input: Iterable[str],
-    output: TextIO,
-    badges: Path | None,
-    generate_dialect_navigation: bool,
+def subcommand[**P](fn: Callable[P, int | None]):
+    """
+    Define a Bowtie subcommand which returns its exit code.
+    """
+
+    @main.command()
+    @click.pass_context
+    @wraps(fn)
+    def run(context: click.Context, *args: P.args, **kwargs: P.kwargs) -> None:
+        exit_code = fn(*args, **kwargs)
+        context.exit(0 if exit_code is None else exit_code)
+
+    return run
+
+
+class Starter(Protocol):
+    connectables: Iterable[Connectable]
+
+    def __call__(
+        self,
+        connectables: Iterable[Connectable] = [],
+    ) -> AsyncIterator[tuple[ConnectableId, Implementation]]: ...
+
+
+class ImplementationSubcommand(Protocol):
+    def __call__(
+        self,
+        start: Starter,
+        **kwargs: Any,
+    ) -> Awaitable[int | None]: ...
+
+
+SILENT = _report.Reporter(write=lambda **_: None)  # type: ignore[reportUnknownArgumentType])
+
+
+def implementation_subcommand(
+    reporter: _report.Reporter = SILENT,
+    default_implementations: Set[str] = Implementation.known(),
 ):
     """
-    Generate a Bowtie report from a previous run.
+    Define a Bowtie subcommand which starts up some implementations.
+
+    Runs the wrapped function with only the successfully started
+    implementations.
     """
-    env = jinja2.Environment(
-        loader=jinja2.PackageLoader("bowtie"),
-        undefined=jinja2.StrictUndefined,
-        keep_trailing_newline=True,
-    )
-    report_data = _report.from_input(input, generate_dialect_navigation)
-    if badges is not None:
-        dialect = report_data["run_info"].dialect
-        report_data["summary"].generate_badges(badges, dialect)
-    template = env.get_template("report.html.j2")
-    output.write(template.render(**report_data))
+
+    def wrapper(fn: ImplementationSubcommand):
+        async def run(
+            connectables: Iterable[Connectable],
+            registry: ValidatorRegistry[Any] = Direct.from_id(
+                "python-jsonschema",
+            ).registry(),
+            **kw: Any,
+        ) -> int:
+            exit_code = 0
+
+            async def start(
+                connectables: Iterable[Connectable] = connectables,
+            ):
+                nonlocal exit_code
+
+                successful = 0
+                async with _start(
+                    connectables=connectables,
+                    registry=registry,
+                    reporter=reporter,
+                ) as implementations:
+                    for each in implementations:  # FIXME: respect --quiet
+                        try:
+                            connectable_implementation = await each
+                        except STARTUP_ERRORS as error:
+                            exit_code |= EX.CONFIG
+                            STDERR.print(error)
+                            continue
+
+                        successful += 1
+                        yield connectable_implementation
+
+                    if not successful and default_implementations:
+                        # TODO: show a diagnostic that collects crash causes
+                        exit_code |= EX.CONFIG
+                        return
+
+            # FIXME: Convert this to an instance presumably, but for now we
+            #        just want this data available in the functions,
+            #        and introducing another type is annoying when most of the
+            #        complexity has to do with _run / _start still existing --
+            #        we need to finish removing them.
+            start.connectables = connectables  # type: ignore[reportFunctionMemberAccess]
+
+            fn_exit_code = await fn(start=start, **kw)  # type: ignore[reportArgumentType]
+            return exit_code | (fn_exit_code or 0)
+
+        @subcommand
+        @click.option(
+            "--implementation",
+            "-i",
+            "connectables",
+            type=_connectables.ClickParam(),
+            default=lambda: (
+                default_implementations
+                if sys.stdin.isatty() or "CI" in os.environ
+                else [line.strip() for line in sys.stdin]
+            ),
+            multiple=True,
+            metavar="IMPLEMENTATION",
+            help=(
+                "A connectable ID for a JSON Schema implementation supported "
+                "by Bowtie. May be repeated multiple times to select multiple "
+                "implementations to run. "
+                "Run `bowtie filter-implementations` for the full list of "
+                "supported implementations."
+            ),
+        )
+        @wraps(fn)
+        def cmd(
+            connectables: Iterable[Connectable],
+            **kwargs: Any,
+        ) -> int:
+            return asyncio.run(run(connectables=connectables, **kwargs))
+
+        return cmd
+
+    return wrapper
 
 
-@main.command()
-@FORMAT
+@subcommand
+@click.option(
+    "--site",
+    default=Path("site"),
+    show_default=True,
+    type=click.Path(
+        path_type=Path,
+        file_okay=False,
+        dir_okay=True,
+        exists=True,
+    ),
+    help=(
+        "The path to a previously generated collection of reports, "
+        "used to generate the badges."
+    ),
+)
+def badges(site: Path):
+    """
+    Generate Bowtie badges for implementations using a previous Bowtie run.
+
+    Will generate badges for any existing dialects, and ignore any for which a
+    report was not generated.
+    """
+    outdir = site / "badges"
+    try:
+        outdir.mkdir()
+    except FileExistsError:
+        error = DiagnosticError(
+            code="already-exists",
+            message="Badge output directory already exists.",
+            causes=[f"{outdir} is an existing directory."],
+            hint_stmt=(
+                "If you intended to replace its contents with new badges, "
+                "delete the directory first."
+            ),
+        )
+        STDERR.print(error)
+        return EX.CONFIG
+
+    supported_versions: dict[Path, Iterable[Dialect]] = {}
+
+    for name, dialect in Dialect.by_short_name().items():
+        try:
+            file = site.joinpath(f"{name}.json").open()
+        except FileNotFoundError:
+            continue
+        with file:
+            report = _report.Report.from_serialized(file)
+            if report.is_empty:
+                error = DiagnosticError(
+                    code="empty-report",
+                    message="A Bowtie report is empty.",
+                    causes=[f"The {name} report contains no results."],
+                    hint_stmt="Check that site generation has not failed.",
+                )
+                STDERR.print(error)
+                return EX.DATAERR
+
+            badge_name = f"{dialect.short_name}.json"
+
+            for each, badge in report.compliance_badges():
+                dir = outdir / each.id
+
+                compliance = dir / "compliance"
+                compliance.mkdir(parents=True, exist_ok=True)
+                compliance.joinpath(badge_name).write_text(json.dumps(badge))
+
+                dialects = each.dialects
+                seen = supported_versions.setdefault(dir, dialects)
+                if seen != dialects:
+                    message = (
+                        f"{dir.name} appears with different "
+                        "supported dialects in the provided reports."
+                    )
+                    error = DiagnosticError(
+                        code="inconsistent-reports",
+                        message=message,
+                        causes=[
+                            f"{file.name} contains:\n{pformat(dialects)}",
+                            f"{pformat(seen)} was previously seen.",
+                        ],
+                        hint_stmt=(
+                            "Check that the implementation produces "
+                            "consistent output and that a run has not failed."
+                        ),
+                    )
+                    STDERR.print(error)
+                    return EX.CONFIG
+
+    for dir, dialects in supported_versions.items():
+        badge = _report.supported_version_badge(dialects=dialects)
+        dir.joinpath("supported_versions.json").write_text(json.dumps(badge))
+
+
+_F = Literal["json", "pretty", "markdown"]
+
+
+def format_option(**option_kwargs: Any) -> Callable[[FC], FC]:
+    if not option_kwargs:
+        option_kwargs = dict(
+            default=lambda: "pretty" if sys.stdout.isatty() else "json",
+            show_default="pretty if stdout is a tty, otherwise JSON",
+            type=click.Choice(["json", "pretty", "markdown"]),
+        )
+
+    def _format_option(fn: FC) -> FC:
+        def show_schema(
+            ctx: click.Context,
+            param: click.Parameter | None,
+            value: bool,
+        ) -> None:
+            if not value or ctx.resilient_parsing:
+                return
+            uri = URL.parse(f"tag:bowtie.report,2024:cli:{ctx.command.name}")
+            schema = Direct.from_id("python-jsonschema").registry().schema(uri)
+            # FIXME: Syntax highlight? But rich appears to be doing some
+            #        bizarre line wrapping, even if I disable a bunch of random
+            #        options (crop, no_wrap, word_wrap in Syntax, ...) which
+            #        fails the integration tests.
+            click.echo(json.dumps(schema, indent=2))
+            ctx.exit()
+
+        return click.option(
+            "--format",
+            "-f",
+            "format",
+            help="What format to use for the output",
+            **option_kwargs,
+        )(
+            click.option(
+                "--schema",
+                callback=show_schema,
+                expose_value=False,
+                is_eager=True,
+                is_flag=True,
+                help="Show the JSON Schema for this command's JSON output.",
+            )(fn),
+        )
+
+    return _format_option
+
+
+class _Report(click.File):
+    """
+    Select a previously produced Bowtie report.
+    """
+
+    name = "report"
+    mode = "r"
+
+    def convert(  # type: ignore[reportIncompatibleMethodOverride]
+        self,
+        value: str | PathLike[str] | IO[Any] | _report.Report,
+        param: click.Parameter | None,
+        ctx: click.Context,
+    ) -> _report.Report:
+        if isinstance(value, _report.Report):
+            return value
+
+        input = super().convert(value, param, ctx)
+        try:
+            return _report.Report.from_serialized(input)
+        except _report.EmptyReport:
+            error = DiagnosticError(
+                code="empty-report",
+                message="The Bowtie report is empty.",
+                causes=[f"{input.name} contains no test result data."],
+                hint_stmt=(
+                    "If you are piping in report data, "
+                    "check to ensure that what you've run has succeeded, "
+                    "otherwise it may be emitting no report data."
+                ),
+            )
+            STDERR.print(error)
+            ctx.exit(EX.NOINPUT)
+        except json.JSONDecodeError as err:
+            error = DiagnosticError(
+                code="report-not-json",
+                message="The Bowtie report looks corrupt.",
+                causes=[f"{input.name} is not valid JSON.", str(err)],
+                hint_stmt=(
+                    "If you are piping in report data, "
+                    "the command producing the report has likely failed "
+                    "and the real error is above this one. "
+                    "Otherwise, ensure you are passing in a report generated "
+                    "by Bowtie."
+                ),
+            )
+            STDERR.print(error)
+            ctx.exit(EX.DATAERR)
+        except _report.MissingFooter:
+            error = DiagnosticError(
+                code="truncated-report",
+                message="The Bowtie report looks corrupt.",
+                causes=[
+                    f"{input.name} is missing its footer, which usually means "
+                    "it has been somehow truncated.",
+                ],
+                hint_stmt=(
+                    "Try running the command you used to produce the report, "
+                    "without piping it. If it crashes, file a bug report!"
+                ),
+            )
+            STDERR.print(error)
+            ctx.exit(EX.DATAERR)
+
+
+@subcommand
+@format_option()
 @click.option(
     "--show",
     "-s",
-    help="""Configure whether to display validation results
-    (whether instances are valid or not) or test failure results
-    (whether the validation results match expected validation results)""",
     default="validation",
     show_default=True,
     type=click.Choice(["failures", "validation"]),
+    help=(
+        "Configure whether to display validation results "
+        "(whether instances are valid or not) or test failure results "
+        "(whether the validation results match expected validation results)"
+    ),
 )
-@click.argument(
-    "input",
-    default="-",
-    type=click.File(mode="r"),
-)
-def summary(input: Iterable[str], format: str, show: str):
+@click.argument("report", default="-", type=_Report())
+def summary(report: _report.Report, format: _F, show: str):
     """
     Generate an (in-terminal) summary of a Bowtie run.
     """
-    summary = _report.from_input(input)["summary"]
     if show == "failures":
-        results = _ordered_failures(summary)
+        results = report.worst_to_best()
+        exit_code = (
+            EX.DATAERR
+            if any(
+                unsuccessful.failed or unsuccessful.errored
+                for _, __, unsuccessful in results
+            )
+            else 0
+        )
         to_table = _failure_table
+        to_markdown_table = _failure_table_in_markdown
+
+        def to_serializable(  # type: ignore[reportRedeclaration]
+            value: Iterable[
+                tuple[ConnectableId, ImplementationInfo, Unsuccessful],
+            ],
+        ):
+            return [(id, u.counts()) for id, _, u in value]
+
+    else:
+        results = report.cases_with_results()
+        exit_code = 0
+        to_table = _validation_results_table
+        to_markdown_table = _validation_results_table_in_markdown
 
         def to_serializable(
-            value: Iterable[tuple[tuple[str, str], _report.Count]],
+            value: Iterable[
+                tuple[
+                    TestCase,
+                    Iterable[tuple[Test, dict[str, AnyTestResult]]],
+                ]
+            ],
         ):
-            return [(metadata, asdict(counts)) for metadata, counts in value]
+            return [
+                (
+                    case.schema,
+                    [
+                        (
+                            test.instance,
+                            {k: v.description for k, v in test_result.items()},
+                        )
+                        for test, test_result in test_results
+                    ],
+                )
+                for case, test_results in value
+            ]
 
-    else:
-        results = _validation_results(summary)
-        to_table = _validation_results_table
-        to_serializable = list  # type: ignore[reportGeneralTypeIssues]
+    match format:
+        case "json":
+            click.echo(json.dumps(to_serializable(results), indent=2))  # type: ignore[reportGeneralTypeIssues]
+        case "pretty":
+            table = to_table(report, results)  # type: ignore[reportGeneralTypeIssues]
+            STDOUT.print(table)
+        case "markdown":
+            table = to_markdown_table(report, results)  # type: ignore[reportGeneralTypeIssues]
+            STDOUT.print(table)
 
-    if format == "json":
-        click.echo(json.dumps(to_serializable(results), indent=2))  # type: ignore[reportGeneralTypeIssues]  # noqa: E501
-    else:
-        table = to_table(summary, results)  # type: ignore[reportGeneralTypeIssues]  # noqa: E501
-        console.Console().print(table)
-
-
-def _ordered_failures(
-    summary: _report._Summary,  # type: ignore[reportPrivateUsage]
-) -> Iterable[tuple[tuple[str, str], _report.Count]]:
-    counts = (
-        (
-            (implementation["name"], implementation["language"]),
-            summary.counts[implementation["image"]],
-        )
-        for implementation in summary.implementations
-    )
-    return sorted(
-        counts,
-        key=lambda each: (each[1].unsuccessful_tests, each[0][0]),  # type: ignore[reportUnknownLambdaType]  # noqa: E501
-        reverse=True,
-    )
+    return exit_code
 
 
 def _failure_table(
-    summary: _report._Summary,  # type: ignore[reportPrivateUsage]
-    results: list[tuple[tuple[str, str], _report.Count]],
+    report: _report.Report,
+    results: list[tuple[ConnectableId, ImplementationInfo, Unsuccessful]],
 ):
-    test = "tests" if summary.total_tests != 1 else "test"
+    test = "tests" if report.total_tests != 1 else "test"
     table = Table(
         "Implementation",
         "Skips",
         "Errors",
         "Failures",
         title="Bowtie",
-        caption=f"{summary.total_tests} {test} ran\n",
+        caption=f"{report.total_tests} {test} ran\n",
     )
-    for (implementation, language), counts in results:
+
+    implementation_counts = Counter(
+        each.id for each in report.implementations.values()
+    )
+    for _, each, unsuccessful in results:
         table.add_row(
-            Text.assemble(implementation, (f" ({language})", "dim")),
-            str(counts.skipped_tests),
-            str(counts.errored_tests),
-            str(counts.failed_tests),
+            Text.assemble(
+                each.name,
+                (
+                    (f" {each.version}", "dim")
+                    if implementation_counts[each.id] > 1
+                    else ("", "")
+                ),
+                (f" ({each.language})", "dim"),
+            ),
+            str(len(unsuccessful.skipped)),
+            str(len(unsuccessful.errored)),
+            str(len(unsuccessful.failed)),
         )
     return table
 
 
-def _validation_results(
-    summary: _report._Summary,  # type: ignore[reportPrivateUsage]
-) -> Iterable[tuple[Any, Iterable[tuple[Any, list[str]]]]]:
-    for case, _, case_results in summary.case_results():
-        results: list[tuple[Any, list[str]]] = []
-        for case_result in case_results:
-            descriptions: list[str] = []
-            for implementation in summary.implementations:
-                valid = case_result[1].get(implementation["image"], "error")
-                if valid == "error":
-                    description = "error"
-                elif valid[1] == "skipped":
-                    description = "skipped"
-                elif valid[0].valid:
-                    description = "valid"
-                else:
-                    description = "invalid"
-                descriptions.append(description)
-            results.append((case_result[0]["instance"], descriptions))
-        yield case["schema"], results
+def _failure_table_in_markdown(
+    report: _report.Report,
+    results: list[tuple[ConnectableId, ImplementationInfo, Unsuccessful]],
+):
+    test = "tests" if report.total_tests != 1 else "test"
+    rows: list[list[str]] = []
+    columns = [
+        "Implementation",
+        "Skips",
+        "Errors",
+        "Failures",
+    ]
+
+    implementation_counts = Counter(
+        each.id for each in report.implementations.values()
+    )
+    for _, each, unsuccessful in results:
+        rows.append(
+            [
+                f"{each.name}"
+                + (
+                    f" {each.version}"
+                    if implementation_counts[each.id] > 1
+                    else ""
+                )
+                + f" ({each.language})",
+                str(len(unsuccessful.skipped)),
+                str(len(unsuccessful.errored)),
+                str(len(unsuccessful.failed)),
+            ],
+        )
+
+    return "\n".join(
+        [
+            "# Bowtie Failures Summary",
+            convert_table_to_markdown(columns, rows),
+            "",
+            f"**{report.total_tests} {test} ran**",
+        ],
+    )
 
 
 def _validation_results_table(
-    summary: _report._Summary,  # type: ignore[reportPrivateUsage]
-    results: Iterable[tuple[Any, Iterable[tuple[Any, dict[str, str]]]]],
+    report: _report.Report,
+    results: Iterable[
+        tuple[TestCase, Iterable[tuple[Test, Mapping[str, AnyTestResult]]]],
+    ],
 ):
-    test = "tests" if summary.total_tests != 1 else "test"
+    test = "tests" if report.total_tests != 1 else "test"
     table = Table(
         Column(header="Schema", vertical="middle"),
         "",
         title="Bowtie",
-        caption=f"{summary.total_tests} {test} ran",
+        caption=f"{report.total_tests} {test} ran",
     )
 
-    for schema, case_results in results:
+    # TODO: sort the columns by results?
+    implementations = report.implementations
+    implementation_counts = Counter(
+        each.id for each in implementations.values()
+    )
+
+    for case, test_results in results:
         subtable = Table("Instance", box=box.SIMPLE_HEAD)
-        for implementation in summary.implementations:
+        for implementation in implementations.values():
             subtable.add_column(
                 Text.assemble(
-                    implementation["name"],
-                    (f" ({implementation['language']})", "dim"),
+                    implementation.name,
+                    (
+                        (f" {implementation.version}", "dim")
+                        if implementation_counts[implementation.id] > 1
+                        else ("", "")
+                    ),
+                    (f" ({implementation.language})", "dim"),
                 ),
             )
 
-        for instance, ordered_results in case_results:
-            subtable.add_row(json.dumps(instance), *ordered_results)
+        for test, test_result in test_results:
+            subtable.add_row(
+                test.syntax(),
+                *(Text(test_result[id].description) for id in implementations),
+            )
 
-        table.add_row(json.dumps(schema, indent=2), subtable)
+        table.add_row(case.syntax(report.metadata.dialect), subtable)
         table.add_section()
 
     return table
 
 
-def validator_for_dialect(dialect: str | None = None):
-    from jsonschema.validators import (
-        validator_for,  # type: ignore[reportUnknownVariableType]
+def _validation_results_table_in_markdown(
+    report: _report.Report,
+    results: Iterable[
+        tuple[TestCase, Iterable[tuple[Test, Mapping[str, AnyTestResult]]]],
+    ],
+):
+    rows_data: list[list[str]] = []
+    final_content = ""
+
+    inner_table_columns = ["Instance"]
+    implementations = report.implementations
+    implementation_counts = Counter(
+        each.id for each in implementations.values()
     )
-    from jsonschema.validators import RefResolver
+    inner_table_columns.extend(
+        f"{implementation.name}"
+        + (
+            f" {implementation.version}"
+            if implementation_counts[implementation.id] > 1
+            else ""
+        )
+        + f" ({implementation.language})"
+        for implementation in implementations.values()
+    )
 
-    text = files("bowtie.schemas").joinpath("io-schema.json").read_text()  # type: ignore[reportUnknownMemberType]  # noqa: E501
-    root_schema = json.loads(text)  # type: ignore[reportUnknownArgumentType]
-    resolver = RefResolver.from_schema(root_schema)  # type: ignore[reportUnknownMemberType]  # noqa: E501
-    Validator = validator_for(root_schema)  # type: ignore[reportUnknownVariableType]  # noqa: E501
-    Validator.check_schema(root_schema)  # type: ignore[reportUnknownMemberType]  # noqa: E501
+    for case, test_results in results:
+        inner_table_rows: list[list[str]] = []
+        for test, test_result in test_results:
+            inner_table_rows.append(
+                [
+                    json.dumps(test.instance),
+                    *(test_result[id].description for id in implementations),
+                ],
+            )
+        inner_markdown_table = convert_table_to_markdown(
+            inner_table_columns,
+            inner_table_rows,
+        )
+        schema_name = json.dumps(case.schema, indent=2)
+        row_data = [schema_name, inner_markdown_table]
+        rows_data.append(row_data)
 
-    if dialect is None:
-        dialect = Validator.META_SCHEMA["$id"]  # type: ignore[reportUnknownMemberType]  # noqa: E501
+    for idx, row_data in enumerate(rows_data):
+        final_content += (
+            f"### {idx + 1}. Schema:\n ```json\n{row_data[0]}\n```\n\n"
+        )
+        final_content += "### Results:"
+        final_content += row_data[1]
+        final_content += "\n"
 
-    def validate(instance: Any, schema: Any) -> None:
-        resolver.store[CURRENT_DIALECT_URI] = {"$ref": dialect}  # type: ignore[reportUnknownMemberType]  # noqa: E501
-        validator = Validator(schema, resolver=resolver)  # type: ignore[reportUnknownVariableType]  # noqa: E501
+    return final_content
+
+
+@subcommand
+@format_option()
+@click.option(
+    "--quantiles",
+    "n",
+    default=4,
+    type=int,
+    help=(
+        "How many quantiles should be emitted for the compliance numbers? "
+        "Computing quantiles only is sensical if this number is more than the "
+        "number of implementations reported on. By default, we compute "
+        "quartiles."
+    ),
+)
+@click.argument(
+    "report",
+    default=lambda: (
+        "-"
+        if not sys.stdin.isatty()
+        else _report.Report.from_serialized(
+            asyncio.run(Dialect.latest().latest_report()).iter_lines(),
+        )
+    ),
+    type=_Report(),
+)
+def statistics(
+    report: _report.Report,
+    n: int,
+    format: _F,
+):
+    """
+    Show summary statistics for a Bowtie generated report.
+
+    If stdin is a TTY, the most recent public report for the latest JSON Schema
+    dialect is downloaded.
+    Otherwise, if it *is not* a TTY (e.g. if it is a pipe) then it should
+    contain report data.
+
+    Piping input via:
+
+      $ bowtie latest-report --dialect <some-dialect> | bowtie statistics
+
+    can be useful to retrieve the latest report for a specific dialect.
+    """
+    dialect, ran_on_date = report.metadata.dialect, report.metadata.started
+    unsuccessful = report.compliance_by_implementation().values()
+    statistics = dict(
+        median=median(unsuccessful),
+        mean=mean(unsuccessful),
+        **(  # quantiles only make sense for n < len(data)
+            {"quantiles": quantiles(unsuccessful, n=n)}
+            if n < len(unsuccessful)
+            else {}
+        ),
+    )
+    match format:
+        case "json":
+            statistics = {
+                "dialect": str(dialect.uri),
+                "ran_on": ran_on_date.isoformat(),
+                **statistics,
+            }
+            click.echo(json.dumps(statistics, indent=2))
+        case "pretty":
+            click.echo(
+                f"Dialect: {dialect.pretty_name}\n"
+                f"Ran on: {ran_on_date.strftime('%x %X %Z')}\n",
+            )
+            for k, v in statistics.items():
+                click.echo(f"{k}: {v}")
+        case "markdown":
+            heading = (
+                f"## Dialect: {dialect.pretty_name}\n\n"
+                f"### Ran on: {ran_on_date.strftime('%x %X %Z')}\n"
+            )
+            markdown = convert_table_to_markdown(
+                columns=["Metric", "Value"],
+                rows=[[k, str(v)] for k, v in statistics.items()],
+            )
+            click.echo(heading + markdown)
+
+
+def do_not_validate(*ignored: SchemaResource) -> Callable[..., None]:
+    return lambda *args, **kwargs: None
+
+
+class _Dialect(click.ParamType):
+    """
+    Select a JSON Schema dialect.
+    """
+
+    name = "dialect"
+
+    def convert(
+        self,
+        value: str | Dialect,
+        param: click.Parameter | None,
+        ctx: click.Context | None,
+    ) -> Dialect:
+        if not isinstance(value, str):
+            return value
+
+        dialect = Dialect.by_alias().get(value)
+        if dialect is not None:
+            return dialect
+
         try:
-            errors = list(validator.iter_errors(instance))  # type: ignore[reportUnknownMemberType]  # noqa: E501
-        except Exception:  # XXX: Warn after Reporter disappears
+            url = URL.parse(value)
+        except RelativeURLWithoutBase:
             pass
         else:
-            if errors:
-                raise _ProtocolError(errors=errors)  # type: ignore[reportPrivateUsage]  # noqa: E501
+            dialect = Dialect.by_uri().get(url)
+            if dialect is not None:
+                return dialect
 
-    return validate
+        self.fail(f"{value!r} is not a known dialect URI or short name.")
+
+    def shell_complete(
+        self,
+        ctx: click.Context,
+        param: click.Parameter,
+        incomplete: str,
+    ) -> list[CompletionItem]:
+        if incomplete:  # the user typed something, so filter over everything
+            suggestions = [
+                (field, dialect)
+                for dialect in Dialect.known()
+                for field in [
+                    str(dialect.uri),
+                    dialect.short_name,
+                    *dialect.aliases,
+                ]
+            ]
+        else:  # the user didn't type anything, only suggest short names
+            suggestions = Dialect.by_short_name().items()
+
+        return [
+            # FIXME: pallets/click#2703
+            CompletionItem(
+                value=value.replace(":", "\\:"),
+                help=f"the {dialect.pretty_name} dialect",
+            )
+            for value, dialect in suggestions
+            if value.startswith(incomplete.lower())
+        ]
 
 
-def do_not_validate(dialect: str | None = None) -> Callable[..., None]:
-    return lambda *args, **kwargs: None
+CaseTransform = Callable[[Iterable[TestCase]], Iterable[TestCase]]
+
+
+class _Filter(click.ParamType):
+    """
+    Filter some test cases by a pattern.
+    """
+
+    name = "filter"
+
+    def convert(
+        self,
+        value: str,
+        param: click.Parameter | None,
+        ctx: click.Context | None,
+    ) -> CaseTransform:
+        return lambda cases: (
+            case for case in cases if fnmatch(case.description, f"*{value}*")
+        )
+
+
+def _set_dialect_via_schema(ctx: click.Context, _, value: _Dialect):
+    """
+    Set the dialect according to a possibly present :kw:`$schema` keyword.
+    """
+    if value:
+        return value
+    schema = ctx.params.get("schema")
+    dialect_from_schema: str | None = (  # type: ignore[reportUnknownVariableType]
+        schema.get("$schema")  # type: ignore[reportUnknownMemberType]
+        if isinstance(schema, dict)
+        else None
+    )
+    return (
+        Dialect.from_str(dialect_from_schema)  # type: ignore[reportUnknownArgumentType]
+        if dialect_from_schema
+        else Dialect.latest()
+    )
+
+
+def _set_schema(dialect: Dialect) -> CaseTransform:
+    """
+    Explicitly set a dialect on schemas passing through by setting ``$schema``.
+    """
+    return lambda cases: (c.with_explicit_dialect(dialect) for c in cases)
+
+
+def _do_nothing(*args: Any, **kwargs: Any) -> CaseTransform:
+    return lambda cases: cases
 
 
 IMPLEMENTATION = click.option(
     "--implementation",
     "-i",
-    "image_names",
-    type=lambda name: name if "/" in name else f"{IMAGE_REPOSITORY}/{name}",  # type: ignore[reportUnknownLambdaType]  # noqa: E501
-    help="A docker image which implements the bowtie IO protocol.",
+    "connectables",
+    type=_connectables.ClickParam(),
     required=True,
     multiple=True,
-)
-DIALECT = click.option(
-    "--dialect",
-    "-D",
-    "dialect",
+    metavar="IMPLEMENTATION",
     help=(
-        "A URI or shortname identifying the dialect of each test case."
-        f"Shortnames include: {sorted(DIALECT_SHORTNAMES)}."
+        "A connectable ID for a JSON Schema implementation supported "
+        "by Bowtie. May be repeated multiple times to select multiple "
+        "implementations to run. "
+        "Run `bowtie filter-implementations` for the full list of "
+        "supported implementations."
     ),
-    type=lambda dialect: DIALECT_SHORTNAMES.get(dialect, dialect),  # type: ignore[reportUnknownLambdaType]  # noqa: E501
-    default=LATEST_DIALECT_NAME,
-    show_default=True,
 )
 FILTER = click.option(
+    "--filter",
     "-k",
-    "filter",
-    type=lambda pattern: f"*{pattern}*",  # type: ignore[reportUnknownLambdaType]  # noqa: E501
+    default="",
+    type=_Filter(),
+    metavar="GLOB",
     help="Only run cases whose description match the given glob pattern.",
 )
-FAIL_FAST = click.option(
-    "-x",
-    "--fail-fast",
-    is_flag=True,
-    default=False,
-    help="Fail immediately after the first error or disagreement.",
-)
 SET_SCHEMA = click.option(
-    "--set-schema/--no-set-schema",
+    "--set-schema",
     "-S",
-    "set_schema",
+    "maybe_set_schema",
+    # I have no idea why Click makes this so hard, but no combination of:
+    #     type, default, is_flag, flag_value, nargs, ...
+    # makes this work without doing it manually with callback.
+    callback=lambda _, __, v: _set_schema if v else _do_nothing,
+    is_flag=True,
     show_default=True,
     default=False,
     help=(
@@ -360,28 +1097,16 @@ SET_SCHEMA = click.option(
         "implementations will differ from what is provided in the input."
     ),
 )
-TIMEOUT = click.option(
-    "--read-timeout",
-    "-T",
-    "read_timeout_sec",
-    metavar="SECONDS",
-    default=2.0,
-    show_default=True,
-    help=(
-        "An explicit timeout to wait for each implementation to respond "
-        "to *each* instance being validated. Set this to 0 if you wish "
-        "to wait forever, though note that this means you may end up waiting "
-        "... forever!"
-    ),
-)
 VALIDATE = click.option(
     "--validate-implementations",
     "-V",
-    "make_validator",
+    "registry",
     # I have no idea why Click makes this so hard, but no combination of:
     #     type, default, is_flag, flag_value, nargs, ...
     # makes this work without doing it manually with callback.
-    callback=lambda _, __, v: validator_for_dialect if v else do_not_validate,  # type: ignore[reportUnknownLambdaType]  # noqa: E501
+    callback=lambda _, __, v: (
+        Direct.from_id("python-jsonschema" if v else "null").registry()
+    ),
     is_flag=True,
     help=(
         "When speaking to implementations (provided via -i), validate "
@@ -392,15 +1117,112 @@ VALIDATE = click.option(
     ),
 )
 
+_inflect_engine = InflectEngine()
 
-@main.command()
-@click.pass_context
+POSSIBLE_DIALECT_SHORTNAMES = _inflect_engine.join(sorted(Dialect.by_alias()))  # type: ignore[reportArgumentType]
+
+
+def pretty_names_str_for(dialects: Iterable[Dialect]) -> str:
+    return (
+        "all known dialects"
+        if list(dialects) == list(Dialect.known())
+        else _inflect_engine.join(
+            [dialect.pretty_name for dialect in dialects],  # type: ignore[reportArgumentType]
+        )
+    )
+
+
+def dialect_option(
+    default: Dialect | None = Dialect.latest(),
+    **kwargs: Any,
+):
+    if default is not None:
+        kwargs.update(default=default, show_default=default.pretty_name)
+
+    return click.option(
+        "--dialect",
+        "-D",
+        "dialect",
+        type=_Dialect(),
+        metavar="URI_OR_NAME",
+        help=(
+            "A URI or shortname identifying the dialect of each test. "
+            f"Possible shortnames include: {POSSIBLE_DIALECT_SHORTNAMES}."
+        ),
+        **kwargs,
+    )
+
+
+def fail_fast(fn: FC) -> FC:
+    conflict = "don't provide both --fail-fast and --max-fail / --max-error"
+
+    # Both are these are needed because parsing is order dependent :/
+    def disallow_fail_fast(
+        ctx: click.Context,
+        _: click.Parameter,
+        value: int | None,
+    ) -> int | None:
+        if ctx.params.get("fail_fast"):
+            if value is None:
+                return 1
+            raise click.UsageError(conflict)
+        return value
+
+    def disallow_max_fail(
+        ctx: click.Context,
+        _: click.Parameter,
+        value: int | None,
+    ) -> int | None:
+        if value and ctx.params.get("max_fail", 1) != 1:
+            raise click.UsageError(conflict)
+        return value
+
+    N = "COUNT"
+    msg = f"Stop running once {N} tests {{}} in total across implementations."
+    return click.option(
+        "-x",
+        "--fail-fast",
+        callback=disallow_max_fail,
+        is_flag=True,
+        default=False,
+        help="Stop running immediately after the first failure or error.",
+    )(
+        click.option(
+            "--max-fail",
+            metavar=N,
+            type=click.IntRange(min=1),
+            callback=disallow_fail_fast,
+            help=msg.format("fail"),
+        )(
+            click.option(
+                "--max-error",
+                metavar=N,
+                type=click.IntRange(min=1),
+                callback=disallow_fail_fast,
+                help=msg.format("error"),
+            )(fn),
+        ),
+    )
+
+
+class JSON(click.File):
+    name = "JSON"
+
+    def convert(
+        self,
+        value: str | PathLike[str] | IO[Any],
+        param: click.Parameter | None,
+        ctx: click.Context | None,
+    ) -> Any:
+        return json.load(super().convert(value, param, ctx))
+
+
+@subcommand
+@dialect_option()
 @IMPLEMENTATION
-@DIALECT
 @FILTER
-@FAIL_FAST
+@fail_fast
 @SET_SCHEMA
-@TIMEOUT
 @VALIDATE
 @click.argument(
     "input",
@@ -408,452 +1230,1424 @@ VALIDATE = click.option(
     type=click.File(mode="rb"),
 )
 def run(
-    context: click.Context,
     input: Iterable[str],
-    filter: str,
+    filter: CaseTransform,
+    dialect: Dialect,
     **kwargs: Any,
 ):
     """
-    Run a sequence of cases provided on standard input.
-    """
-    cases = (TestCase.from_dict(**json.loads(line)) for line in input)
-    if filter:
-        cases = (case for case in cases if fnmatch(case.description, filter))
+    Run test cases written directly in Bowtie's testing format.
 
-    exit_code = asyncio.run(_run(**kwargs, cases=cases))
-    context.exit(exit_code)
-
-
-@main.command()
-@click.pass_context
-@IMPLEMENTATION
-@DIALECT
-@SET_SCHEMA
-@TIMEOUT
-@VALIDATE
-@click.argument("schema", type=click.File(mode="rb"))
-@click.argument("instances", nargs=-1, type=click.File(mode="rb"))
-def validate(
-    context: click.Context,
-    schema: TextIO,
-    instances: Iterable[TextIO],
-    **kwargs: Any,
-):
+    This is generally useful if you wish to hand-author which schemas to
+    include in the schema registry, or otherwise exactly control the contents
+    of a test case.
     """
-    Validate a schema & one or more instances across implementations.
-    """
-    case = TestCase(
-        description="bowtie validate",
-        schema=json.load(schema),
-        tests=[
-            Test(description=str(i), instance=json.load(instance))
-            for i, instance in enumerate(instances, 1)
-        ],
+    cases = filter(
+        TestCase.from_dict(dialect=dialect, **json.loads(line))
+        for line in input
     )
-    exit_code = asyncio.run(_run(fail_fast=False, **kwargs, cases=[case]))
-    context.exit(exit_code)
+
+    return asyncio.run(_run(**kwargs, cases=cases, dialect=dialect))
 
 
-@main.command()
-@click.pass_context
-@FORMAT
+@subcommand
+@dialect_option(default=None, callback=_set_dialect_via_schema)
 @IMPLEMENTATION
-def info(context: click.Context, **kwargs: Any):
+@SET_SCHEMA
+@VALIDATE
+@click.option(
+    "-d",
+    "--description",
+    default="bowtie validate",
+    help="A (human-readable) description for this test case.",
+)
+@click.option(
+    "--expect",
+    show_default=True,
+    show_choices=True,
+    default="any",
+    type=click.Choice(["valid", "invalid", "any"], case_sensitive=False),
+    callback=lambda _, __, value: (
+        None if value == "any" else value == "valid"
+    ),
+    help=(
+        "Expect the given input to be considered valid or invalid, "
+        "or else (with 'any') to allow either result."
+    ),
+)
+@click.argument("schema", type=JSON())
+@click.argument("instances", nargs=-1, type=JSON())
+def validate(
+    schema: Any,
+    instances: Iterable[Any],
+    expect: bool | None,
+    description: str,
+    **kwargs: Any,
+):
     """
-    Retrieve a particular implementation (harness)'s metadata.
+    Validate instances under a schema across any supported implementation.
     """
-    exit_code = asyncio.run(_info(**kwargs))
-    context.exit(exit_code)
+    if not instances:
+        return EX.NOINPUT
+
+    tests = [Example(description="", instance=each) for each in instances]
+    if expect is not None:
+        tests = [test.expect(expect) for test in tests]
+    case = TestCase(description=description, schema=schema, tests=tests)
+    return asyncio.run(_run(fail_fast=False, **kwargs, cases=[case]))
 
 
-async def _info(image_names: list[str], format: str):
-    exit_code = 0
-    async with _start(
-        image_names=image_names,
-        make_validator=validator_for_dialect,
-        reporter=_report.Reporter(),
-    ) as starting:
-        for each in asyncio.as_completed(starting):
-            try:
-                implementation = await each
-            except NoSuchImage as error:
-                exit_code |= os.EX_CONFIG
-                click.echo(
-                    f"❗ (error): {error.name!r} is not a known Bowtie implementation.",  # noqa: E501
-                )
-                continue
+def _set_benchmarker_callable(
+    ctx: click.Context,
+    value: Any,
+    callable: Callable[..., Any],
+) -> Any:
+    if value:
+        ctx.params["benchmarker_callable"] = callable
+    return value
 
-            if implementation.metadata is None:
-                exit_code |= os.EX_CONFIG
-                click.echo("  ❗ (error): startup failed")
-                continue
 
-            metadata = {
-                k: v
-                for k, v in sorted(
-                    implementation.metadata.items(),
-                    key=lambda kv: (
-                        kv[0] != "name",
-                        kv[0] != "language",
-                        kv[0] != "version",
-                        kv[0] == "dialects",
-                        kv[0],
-                    ),
-                )
-            }
-            if format == "json":
-                click.echo(json.dumps(metadata, indent=2))
-            else:
+@subcommand
+@IMPLEMENTATION
+@dialect_option()
+@format_option()
+@click.option(
+    "--runs",
+    "-r",
+    "runs",
+    type=int,
+    default=3,
+    show_default=True,
+    help="Number of runs used to run benchmarks.",
+)
+@click.option(
+    "--values",
+    "-v",
+    "values",
+    type=click.IntRange(min=2),
+    default=2,
+    show_default=True,
+    help="Number of values per run.",
+)
+@click.option(
+    "--warmups",
+    "-w",
+    "warmups",
+    type=int,
+    default=1,
+    show_default=True,
+    help="Number of skipped values per run used to warmup the benchmark.",
+)
+@click.option(
+    "--loops",
+    "-l",
+    "loops",
+    type=int,
+    default=1,
+    show_default=True,
+    help="Number of loops per value.",
+)
+@click.option(
+    "--quiet",
+    "-q",
+    "quiet",
+    is_flag=True,
+    default=False,
+    show_default=True,
+    help="Enable quiet mode (Only output the final result).",
+)
+@click.option(
+    "--keywords",
+    "-k",
+    "keywords",
+    callback=lambda ctx, __, value: (
+        _set_benchmarker_callable(
+            ctx,
+            value,
+            _benchmarks.Benchmarker.for_keywords,
+        )
+    ),
+    is_flag=True,
+    show_default=True,
+    help=(
+        "Run keyword specific benchmarks to learn about how "
+        "various implementations implement the keyword."
+    ),
+)
+@click.option(
+    "-b",
+    "--benchmark-file",
+    "benchmark_files",
+    callback=lambda ctx, __, value: (
+        _set_benchmarker_callable(
+            ctx,
+            value,
+            _benchmarks.Benchmarker.for_benchmark_files,
+        )
+    ),
+    multiple=True,
+    help=(
+        "Allows running benchmark from a file. "
+        "Specify the path of the benchmark file"
+    ),
+)
+@click.option(
+    "--test-suite",
+    "-t",
+    "test_suite",
+    callback=lambda ctx, __, value: (
+        _set_benchmarker_callable(
+            ctx,
+            value,
+            _benchmarks.Benchmarker.from_test_cases,
+        )
+    ),
+    type=_suite.ClickParam(),
+    default=None,
+    help="Run Benchmarks over the official JSON Schema Test Suite.",
+)
+@click.argument(
+    "benchmark",
+    type=JSON(),
+    required=False,
+    callback=lambda ctx, __, value: (
+        _set_benchmarker_callable(
+            ctx,
+            value,
+            _benchmarks.Benchmarker.from_input,
+        )
+    ),
+)
+def perf(
+    connectables: Iterable[_connectables.Connectable],
+    dialect: Dialect,
+    format: _F,
+    quiet: bool,
+    benchmarker_callable: Callable[..., Any] = (
+        _benchmarks.Benchmarker.from_default_benchmarks
+    ),
+    **kwargs: Any,
+):
+    """
+    Perform performance measurements across supported implementations.
+    """
+    if kwargs.get("test_suite"):
+        cases, enforced_dialect, _ = kwargs["test_suite"]
+        dialect = enforced_dialect
+        kwargs["cases"] = cases
+
+    try:
+        benchmarker = benchmarker_callable(dialect=dialect, **kwargs)
+        asyncio.run(
+            benchmarker.start(
+                connectables=connectables,
+                dialect=dialect,
+                quiet=quiet,
+                format=format,
+            ),
+        )
+    except (_benchmarks.BenchmarkError, _benchmarks.BenchmarkLoadError) as err:
+        STDERR.print(err)
+        return EX.DATAERR
+
+    return 0
+
+
+@subcommand
+@dialect_option()
+@click.option(
+    "-t",
+    "--benchmark-type",
+    type=click.Choice(["default", "keyword"]),
+    default=None,
+    show_default=True,
+    help=("Specify the type of benchmark to filter."),
+)
+@click.option(
+    "-n",
+    "--name",
+    "benchmark_names",
+    type=str,
+    multiple=True,
+    help=(
+        "Filter the benchmarks with given name. "
+        "Use the option multiple times to filter multiple benchmarks."
+    ),
+)
+def filter_benchmarks(
+    dialect: Dialect,
+    benchmark_type: str | None,
+    benchmark_names: Iterable[str],
+):
+    """
+    Output benchmarks matching the specified criteria.
+    """
+    files: list[Path] = _benchmarks.get_benchmark_files(
+        benchmark_type,
+        benchmarks=benchmark_names,
+        dialect=dialect,
+    )
+    for file in files:
+        STDOUT.file.write(f"{file}\n")
+
+
+LANGUAGE_ALIASES = {
+    "cpp": "c++",
+    "js": "javascript",
+    "ts": "typescript",
+}
+KNOWN_LANGUAGES = {
+    *LANGUAGE_ALIASES.values(),
+    *(i.partition("-")[0] for i in Implementation.known()),
+}
+
+
+@implementation_subcommand()  # type: ignore[reportArgumentType]
+@format_option(
+    default="plain",
+    show_default=True,
+    type=click.Choice(["plain", "json"]),
+)
+@click.option(
+    "--supports-dialect",
+    "-d",
+    "dialects",
+    type=_Dialect(),
+    default=cast("frozenset[Dialect]", frozenset()),
+    metavar="URI_OR_NAME",
+    multiple=True,
+    help=(
+        "Only include implementations supporting the given dialect URI "
+        "or dialect shortname. "
+        f"Possible shortnames include: {POSSIBLE_DIALECT_SHORTNAMES}."
+    ),
+)
+@click.option(
+    "--language",
+    "-l",
+    "languages",
+    type=click.Choice(sorted(KNOWN_LANGUAGES), case_sensitive=False),
+    callback=lambda _, __, value: (
+        KNOWN_LANGUAGES
+        if not value
+        else frozenset(LANGUAGE_ALIASES.get(each, each) for each in value)
+    ),
+    multiple=True,
+    metavar="LANGUAGE",
+    help="Only include implementations in the given programming language.",
+)
+@click.option(
+    "--direct",
+    "filter_connectable",
+    is_flag=True,
+    callback=lambda _, __, value: (  # type: ignore[reportUnknownLambdaType]
+        (lambda connectable: connectable.kind == "direct")  # type: ignore[reportUnknownLambdaType]
+        if value
+        else (lambda connectable: True)  # type: ignore[reportUnknownLambdaType]
+    ),
+    help=(
+        "Only include implementations with direct connectable functionality "
+        "(i.e. which can run without the presence of a container runtime)."
+    ),
+)
+async def filter_implementations(
+    start: Starter,
+    dialects: Sequence[Dialect],
+    languages: Set[str],
+    filter_connectable: Callable[[Connectable], bool],
+    format: Literal["plain", "json"],
+):
+    """
+    Output implementations which match the given criteria.
+
+    Useful for piping or otherwise using the resulting output for further
+    Bowtie commands.
+    """
+    filtered = (c for c in start.connectables if filter_connectable(c))
+    if not dialects and languages == KNOWN_LANGUAGES:
+        # speed up `bowtie filter-implementations`with no args or with --direct
+        matching = [each.to_terse() for each in filtered]
+    else:
+        matching: Sequence[str] = [
+            name
+            async for name, each in start(connectables=filtered)
+            if each.supports(*dialects) and each.info.language in languages
+        ]
+
+    match format:
+        case "json":
+            click.echo(json.dumps(matching, indent=2))
+        case "plain":
+            for name in matching:
+                click.echo(name)
+
+
+@implementation_subcommand(default_implementations=frozenset())  # type: ignore[reportArgumentType]
+@click.option(
+    "--dialect",
+    "-d",
+    "dialects",
+    type=_Dialect(),
+    default=Dialect.known(),
+    metavar="URI_OR_NAME",
+    multiple=True,
+    help="Filter from the given list of dialects only.",
+)
+@click.option(
+    "--latest",
+    "-l",
+    "latest",
+    is_flag=True,
+    default=False,
+    help="Show only the latest dialect.",
+)
+@click.option(
+    "--boolean-schemas/--no-boolean-schemas",
+    "-b/-B",
+    "booleans",
+    default=None,
+    help=(
+        "If provided, show only dialects which do (or do not) "
+        "support boolean schemas. Otherwise show either kind."
+    ),
+)
+async def filter_dialects(
+    start: Starter,
+    dialects: Iterable[Dialect],
+    latest: bool,
+    booleans: bool | None,
+):
+    """
+    Output dialect URIs matching a given criteria.
+
+    If any implementations are provided, filter dialects supported by all the
+    given implementations.
+    """
+    matching = {
+        dialect
+        for dialect in dialects
+        if booleans is None or dialect.has_boolean_schemas == booleans
+    }
+
+    async for _, implementation in start():
+        matching &= implementation.info.dialects
+
+    if not matching:
+        click.echo("No dialects match.", file=sys.stderr)
+        return EX.DATAERR
+
+    for dialect in sorted(matching, reverse=True):
+        click.echo(dialect.uri)
+        if latest:
+            break
+
+
+@subcommand
+@dialect_option()
+def latest_report(dialect: Dialect):
+    """
+    Output the latest published report from Bowtie's website.
+    """
+
+    async def write(response: Awaitable[Response]):
+        async for chunk in (await response).aiter_bytes():
+            click.echo(chunk)
+
+    asyncio.run(write(dialect.latest_report()))
+
+
+def _info_links_table_for(metadata: dict[str, Any]):
+    table = Table(
+        Column(style="spring_green4"),
+        box=None,
+        padding=(0, 1, 0, 0),
+        show_header=False,
+    )
+
+    table.add_row("homepage", metadata["homepage"])
+    table.add_row("source", metadata["source"])
+    table.add_row("issues", metadata["issues"])
+
+    if "documentation" in metadata:
+        table.add_row("documentation", metadata["documentation"])
+
+    for link in metadata.get("links", []):
+        table.add_row(link["description"], link["url"])
+
+    return table
+
+
+def _info_table_for(metadata: dict[str, Any]):
+    table = Table(
+        Column(style="cyan bold"),
+        box=box.ROUNDED,
+        show_header=False,
+        border_style="bright_black",
+    )
+
+    table.add_row(
+        "implementation",
+        f"{metadata['name']} [grey58]{metadata.get('version', '')}[/grey58]",
+    )
+    table.add_row(
+        "language",
+        f"{metadata['language']} [grey58]{metadata.get('language_version', '')}[/grey58]",  # noqa: E501
+    )
+    table.add_row(
+        "dialects",
+        "\n".join(
+            Dialect.from_str(dialect).pretty_name
+            for dialect in cast("list[str]", metadata.get("dialects"))
+        ),
+        end_section=True,
+    )
+    table.add_row("links", _info_links_table_for(metadata))
+
+    if "os" in metadata:
+        table.caption = Text(
+            f"Ran on {metadata['os']} {metadata.get('os_version', '')}",
+            style="bright_black",
+        )
+
+    return table
+
+
+@implementation_subcommand()  # type: ignore[reportArgumentType]
+@format_option()
+@click.option(
+    "--versions/--no-versions",
+    "show_versions",
+    help="Also show all implementation versions which Bowtie supports.",
+)
+async def info(
+    start: Starter,
+    format: _F,
+    show_versions: bool,
+):
+    """
+    Show information about a supported implementation.
+    """
+    serializable: dict[ConnectableId, dict[str, Any]] = {}
+
+    async for _, each in start():
+        metadata = [(k, v) for k, v in each.info.serializable().items() if v]
+        if show_versions:
+            metadata.append(("versions", await each.get_versions()))
+
+        metadata.sort(
+            key=lambda kv: (
+                kv[0] != "name",
+                kv[0] != "language",
+                kv[0] != "version",
+                kv[0] == "links",
+                kv[0] == "versions",
+                kv[0] == "dialects",
+                kv[0],
+            ),
+        )
+
+        match format:
+            case "json":
+                serializable[each.id] = dict(metadata)
+            case "pretty":
+                table = _info_table_for(dict(metadata))
+                STDOUT.print(table, "\n")
+            case "markdown":
                 click.echo(
                     "\n".join(
-                        f"{k}: {json.dumps(v, indent=2)}"
-                        for k, v in metadata.items()
+                        f"**{k}**: {json.dumps(v, indent=2)}"
+                        for k, v in metadata
                     ),
                 )
-    return exit_code
+
+    if format == "json":
+        if len(serializable) == 1:
+            (output,) = serializable.values()
+        else:
+            output = serializable
+        click.echo(json.dumps(output, indent=2))
 
 
-@main.command()
-@click.pass_context
-@FORMAT
-@IMPLEMENTATION
-def smoke(context: click.Context, **kwargs: Any):
-    """
-    Smoke test one or more implementations for basic correctness.
-    """
-    exit_code = asyncio.run(_smoke(**kwargs))
-    context.exit(exit_code)
+async def download_versions_of(id: ConnectableId) -> frozenset[str]:
+    progress = Progress(
+        TextColumn("[bold blue]{task.description}"),
+        SpinnerColumn(finished_text=""),
+        BarColumn(bar_width=None),
+        TextColumn(
+            "[progress.percentage]{task.percentage:>3.0f}%",
+        ),
+        "•",
+        DownloadColumn(),
+        "•",
+        TimeElapsedColumn(),
+        console=STDOUT,
+        transient=True,
+    )
+    task = progress.add_task(
+        description=f"Fetching versions of {id}",
+        total=None,
+    )
 
-
-async def _smoke(image_names: list[str], format: str):
-    exit_code = 0
-    async with _start(
-        image_names=image_names,
-        make_validator=validator_for_dialect,
-        reporter=_report.Reporter(),
-    ) as starting:
-        for each in asyncio.as_completed(starting):
+    async with httpx.AsyncClient(timeout=10) as client:
+        with progress:
             try:
-                implementation = await each
-            except NoSuchImage as error:
-                exit_code |= os.EX_CONFIG
-                click.echo(
-                    f"❗ (error): {error.name!r} is not a known Bowtie implementation.",  # noqa: E501
-                    file=sys.stderr,
+                url = (
+                    HOMEPAGE / "implementations" / id / "matrix-versions.json"
                 )
-                continue
+                response = await client.get(str(url))
+                response.raise_for_status()
+            except httpx.HTTPStatusError as err:
+                progress.update(
+                    task,
+                    description=(
+                        f"[bold red]Could not fetch versions of "
+                        f"{id}: {err.response.status_code}"
+                    ),
+                    completed=None,
+                    total=None,
+                    advance=None,
+                )
+                return frozenset()
+            else:
+                content = response.content
+                content_length = len(content)
 
-            click.echo(f"Testing {implementation.name!r}...", file=sys.stderr)
+                progress.update(
+                    task,
+                    description=(
+                        f"Successfully fetched all versions of {id}!"
+                    ),
+                    completed=content_length,
+                    total=content_length,
+                    advance=content_length,
+                )
+                return frozenset(json.loads(content))
 
-            if implementation.metadata is None:
-                exit_code |= os.EX_CONFIG
-                click.echo("  ❗ (error): startup failed", file=sys.stderr)
-                continue
 
-            dialect = implementation.dialects[0]
-            runner = await implementation.start_speaking(dialect)
+async def download_and_parse_reports_for(
+    id: ConnectableId,
+    versions: Set[str],
+    dialects: Iterable[Dialect],
+) -> Iterable[tuple[str, Dialect, _report.Report]]:
+    pretty_names_str = pretty_names_str_for(dialects)
 
-            cases = [
-                TestCase(
-                    description="allow-everything schema",
-                    schema={"$schema": dialect},
-                    tests=[
-                        Test(description="First", instance=1, valid=True),
-                        Test(description="Second", instance="foo", valid=True),
+    progress = Progress(
+        TextColumn("[bold blue]{task.description}"),
+        SpinnerColumn(finished_text=""),
+        BarColumn(bar_width=None),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        "•",
+        MofNCompleteColumn(),
+        "•",
+        TimeElapsedColumn(),
+        console=STDOUT,
+        transient=True,
+    )
+
+    if versions:
+        total_files = len(versions) * len(list(dialects))
+        actual_downloaded_files = 0
+
+        task = progress.add_task(
+            description=(
+                "Preparing to download and parse versioned "
+                f"reports of {id} for {pretty_names_str}"
+            ),
+            total=total_files,
+        )
+
+        async with httpx.AsyncClient(timeout=10) as client:
+
+            async def download_and_parse_versioned_report_for(
+                version: str,
+                dialect: Dialect,
+            ):
+                try:
+                    url = (
+                        HOMEPAGE
+                        / "implementations"
+                        / id
+                        / f"v{version}"
+                        / f"{dialect.short_name}.json"
+                    )
+                    response = await client.get(str(url))
+                    response.raise_for_status()
+                    progress.update(
+                        task,
+                        description=(
+                            f"Downloading and Parsing: "
+                            f"v{version}/{dialect.short_name}.json"
+                        ),
+                    )
+                except httpx.HTTPStatusError:
+                    report = _report.Report.empty(dialect=dialect)
+                    progress.update(task, advance=1)
+                    return version, dialect, report
+                else:
+                    nonlocal actual_downloaded_files
+                    actual_downloaded_files += 1
+
+                    report = _report.Report.from_serialized(
+                        response.iter_lines(),
+                    )
+                    progress.update(task, advance=1)
+                    return version, dialect, report
+
+            with progress:
+                responses = await asyncio.gather(
+                    *[
+                        download_and_parse_versioned_report_for(
+                            version,
+                            dialect,
+                        )
+                        for version in versions
+                        for dialect in dialects
                     ],
+                )
+
+                progress.update(
+                    task,
+                    description=(
+                        "Successfully downloaded and parsed all versioned "
+                        f"reports of {id} for {pretty_names_str}!"
+                    ),
+                    completed=actual_downloaded_files,
+                    total=actual_downloaded_files,
+                )
+                return responses
+    else:
+        total_files = len(list(dialects))
+
+        task = progress.add_task(
+            description=(
+                f"Preparing to download and parse latest "
+                f"reports of {id} for {pretty_names_str}"
+            ),
+            total=total_files,
+        )
+
+        async def download_and_parse_latest_report_for(dialect: Dialect):
+            try:
+                response = await dialect.latest_report()
+                response.raise_for_status()
+                progress.update(
+                    task,
+                    description=(
+                        f"Downloading and Parsing: "
+                        f"latest/{dialect.short_name}.json"
+                    ),
+                )
+            except httpx.HTTPStatusError:
+                report = _report.Report.empty(dialect=dialect)
+                progress.update(task, advance=1)
+                return "latest", dialect, report
+            else:
+                report = _report.Report.from_serialized(response.iter_lines())
+                progress.update(task, advance=1)
+                return "latest", dialect, report
+
+        with progress:
+            responses = await asyncio.gather(
+                *[
+                    download_and_parse_latest_report_for(dialect)
+                    for dialect in dialects
+                ],
+            )
+
+            progress.update(
+                task,
+                description=(
+                    f"Successfully downloaded and parsed all latest "
+                    f"reports of {id} for {pretty_names_str}!"
                 ),
-                TestCase(
-                    description="allow-nothing schema",
-                    schema={"$schema": dialect, "not": {}},
-                    tests=[
-                        Test(description="First", instance=12, valid=False),
+                completed=total_files,
+                total=total_files,
+            )
+            return responses
+
+
+def _trend_table_for(
+    id: ConnectableId,
+    versions: Set[str],
+    dialects_trend: dict[Dialect, _report.Report],
+) -> Table:
+    main_table = Table(show_lines=True)
+    main_table.add_column(
+        "Dialect",
+        justify="center",
+        vertical="middle",
+    )
+    main_table.add_column(
+        f"Trend Data of {id} versions",
+        justify="center",
+    )
+
+    def add_sub_table_row(
+        sub_table: Table,
+        version: str,
+        unsuccessful: Unsuccessful,
+    ):
+        sub_table.add_row(
+            version,
+            str(len(unsuccessful.skipped)),
+            str(len(unsuccessful.errored)),
+            str(len(unsuccessful.failed)),
+        )
+
+    for dialect, report in dialects_trend.items():
+        test = "tests" if report.total_tests != 1 else "test"
+        sub_table = Table(
+            "Version",
+            "Skips",
+            "Errors",
+            "Failures",
+            caption=f"{report.total_tests} {test} ran",
+            show_edge=False,
+        )
+
+        if versions:
+            for version, unsuccessful in report.latest_to_oldest():
+                add_sub_table_row(sub_table, version, unsuccessful)
+        else:
+            implementation = report.implementations[id]
+            version = implementation.version or "latest"
+            unsuccessful = report.unsuccessful(id)
+            add_sub_table_row(sub_table, version, unsuccessful)
+
+        main_table.add_row(dialect.pretty_name, sub_table)
+
+    return main_table
+
+
+def _trend_table_in_markdown_for(
+    id: ConnectableId,
+    versions: Set[str],
+    dialects_trend: dict[Dialect, _report.Report],
+) -> str:
+    rows_data: list[list[str]] = []
+
+    inner_table_columns = [
+        "Version",
+        "Skips",
+        "Errors",
+        "Failures",
+    ]
+
+    def create_inner_table_row(
+        version: str,
+        unsuccessful: Unsuccessful,
+    ):
+        return [
+            version,
+            str(len(unsuccessful.skipped)),
+            str(len(unsuccessful.errored)),
+            str(len(unsuccessful.failed)),
+        ]
+
+    for dialect, report in dialects_trend.items():
+        test = "tests" if report.total_tests != 1 else "test"
+        inner_table_rows: list[list[str]] = []
+        if versions:
+            for version, unsuccessful in report.latest_to_oldest():
+                inner_table_rows.append(
+                    create_inner_table_row(version, unsuccessful),
+                )
+        else:
+            implementation = report.implementations[id]
+            version = implementation.version or "latest"
+            unsuccessful = report.unsuccessful(id)
+            inner_table_rows.append(
+                create_inner_table_row(version, unsuccessful),
+            )
+
+        inner_markdown_table = convert_table_to_markdown(
+            inner_table_columns,
+            inner_table_rows,
+        )
+        row_data = [
+            dialect.pretty_name,
+            inner_markdown_table,
+            f"**{report.total_tests} {test} ran**",
+        ]
+        rows_data.append(row_data)
+
+    return f"## Trend Data of {id} versions:\n\n" + "\n\n".join(
+        [
+            f"### Dialect: {row_data[0]}\n{row_data[1]}\n\n{row_data[2]}"
+            for row_data in rows_data
+        ],
+    )
+
+
+class _VersionedReportsTar(click.File):
+    """
+    Select a tar containing previously produced versioned Bowtie reports.
+    """
+
+    name = "versioned_reports_tar"
+    mode = "rb"
+
+    def convert(  # type: ignore[reportIncompatibleMethodOverride]
+        self,
+        value: str | PathLike[str] | IO[Any],
+        param: click.Parameter | None,
+        ctx: click.Context,
+    ) -> tuple[frozenset[str], Iterable[tuple[str, Dialect, _report.Report]]]:
+        input = super().convert(value, param, ctx)
+
+        id = cast(
+            "_connectables.Connectable",
+            ctx.params.get("connectable"),
+        ).to_terse()
+
+        try:
+            with tarfile.open(fileobj=input) as tar:
+                members = tar.getmembers()
+
+                if not any(
+                    member.name.startswith(f"./{id}/") for member in members
+                ):
+                    STDERR.print(
+                        f"Couldn't find a '{id}' directory in {input.name}.",
+                    )
+                    ctx.exit(EX.DATAERR)
+
+                versions: frozenset[str] = frozenset()
+                try:
+                    versions_content = tar.extractfile(
+                        f"./{id}/matrix-versions.json",
+                    )
+                except KeyError:
+                    STDERR.print(
+                        "No versions detected (couldn't find a "
+                        "'matrix-versions.json' file in ",
+                        f"{id} directory of {input.name}.)",
+                    )
+                    ctx.exit(EX.DATAERR)
+                else:
+                    if versions_content:
+                        versions = frozenset(json.load(versions_content))
+
+                versions_dirs = [
+                    member.name
+                    for member in members
+                    if member.isdir()
+                    and (
+                        member.name.removeprefix(f"./{id}/").removeprefix("v")
+                    )
+                    in versions
+                ]
+                if not versions_dirs:
+                    STDERR.print(
+                        f"Couldn't find any versions sub-directories in {id} "
+                        f"directory of {input.name} as per listed by its "
+                        "matrix-versions.json file.",
+                    )
+                    ctx.exit(EX.DATAERR)
+
+                progress = Progress(
+                    TextColumn("[bold blue]{task.description}"),
+                    SpinnerColumn(finished_text=""),
+                    BarColumn(bar_width=None),
+                    TextColumn(
+                        "[progress.percentage]{task.percentage:>3.0f}%",
+                    ),
+                    "•",
+                    MofNCompleteColumn(),
+                    "•",
+                    TimeElapsedColumn(),
+                    console=STDOUT,
+                    transient=True,
+                )
+                dialects = (
+                    cast(
+                        "Iterable[Dialect] | None",
+                        ctx.params.get("dialects"),
+                    )
+                    or Dialect.known()
+                )
+                pretty_names_str = pretty_names_str_for(dialects)
+                task = progress.add_task(
+                    description=(
+                        f"Preparing to parse all versioned reports of "
+                        f"{id} for {pretty_names_str} found in {input.name}"
+                    ),
+                    total=len(versions) * len(list(dialects)),
+                )
+
+                actual_parsed_files = 0
+                versioned_reports: Iterable[
+                    tuple[str, Dialect, _report.Report]
+                ] = []
+
+                with progress:
+                    for version in versions:
+                        for dialect in dialects:
+                            progress.update(
+                                task,
+                                description=(
+                                    f"Parsing: "
+                                    f"v{version}/{dialect.short_name}.json"
+                                ),
+                            )
+                            try:
+                                report_content = tar.extractfile(
+                                    f"./{id}/v{version}/{dialect.short_name}.json",
+                                )
+                            except KeyError:
+                                versioned_reports.append(
+                                    (
+                                        version,
+                                        dialect,
+                                        _report.Report.empty(dialect=dialect),
+                                    ),
+                                )
+                            else:
+                                if report_content:
+                                    versioned_reports.append(
+                                        (
+                                            version,
+                                            dialect,
+                                            _report.Report.from_serialized(
+                                                TextIOWrapper(
+                                                    report_content,
+                                                    encoding="utf-8",
+                                                ),
+                                            ),
+                                        ),
+                                    )
+                                    actual_parsed_files += 1
+                            progress.update(task, advance=1)
+                    progress.update(
+                        task,
+                        description=(
+                            f"Successfully parsed all versioned reports "
+                            f"of {id} for {pretty_names_str} found in "
+                            f"{input.name}"
+                        ),
+                        completed=actual_parsed_files,
+                        total=actual_parsed_files,
+                    )
+                    return versions, versioned_reports
+        except tarfile.TarError:
+            STDERR.print(f"Failed to process {input.name}.")
+            ctx.exit(EX.DATAERR)
+
+
+@subcommand
+@click.option(
+    "--implementation",
+    "-i",
+    "connectable",
+    required=True,
+    multiple=False,
+    default=None,
+    type=_connectables.ClickParam(),
+    metavar="IMPLEMENTATION",
+    help=(
+        "A connectable ID for a JSON Schema implementation supported "
+        "by Bowtie. Run `bowtie filter-implementations` for the full "
+        "list of supported implementations."
+    ),
+)
+@click.option(
+    "--dialect",
+    "-D",
+    "dialects",
+    multiple=True,
+    default=lambda: Dialect.known(),
+    type=_Dialect(),
+    metavar="URI_OR_NAME",
+    help=(
+        "A URI or shortname identifying the dialect of the test suite "
+        "you wish to see the trend data for. Possible shortnames include: "
+        f"{POSSIBLE_DIALECT_SHORTNAMES}. If none specified then defaults "
+        "to all known dialects."
+    ),
+)
+@click.argument(
+    "versioned_reports_tar",
+    default=None,
+    type=_VersionedReportsTar(mode="rb"),
+    required=False,
+)
+@format_option()
+def trend(
+    connectable: Connectable,
+    dialects: Iterable[Dialect],
+    versioned_reports_tar: (
+        tuple[
+            frozenset[str],
+            Iterable[tuple[str, Dialect, _report.Report]],
+        ]
+        | None
+    ),
+    format: _F,
+):
+    """
+    Show trend data of an implementation across its multiple versions.
+    """
+    id = connectable.to_terse()
+
+    if not versioned_reports_tar:
+
+        async def download_versions_and_parse_reports_for(
+            id: ConnectableId,
+            dialects: Iterable[Dialect],
+        ):
+            versions = await download_versions_of(id)
+            downloaded_versioned_reports = (
+                await download_and_parse_reports_for(
+                    id,
+                    versions,
+                    dialects,
+                )
+            )
+            return versions, downloaded_versioned_reports
+
+        versions, versioned_reports = asyncio.run(
+            download_versions_and_parse_reports_for(id, dialects),
+        )
+    else:
+        versions, versioned_reports = versioned_reports_tar
+
+    if all(report.is_empty for _, _, report in versioned_reports):
+        click.echo(
+            f"None of the versions of '{id}' "
+            f"support {pretty_names_str_for(dialects)}.",
+        )
+        return
+
+    if versions:
+        combine_versioned_reports_for = (
+            _report.Report.combine_versioned_reports_for
+        )
+        dialects_trend = {
+            dialect: combined_versions_report
+            for dialect in sorted(dialects, reverse=True)
+            if (
+                combined_versions_report := combine_versioned_reports_for(
+                    [report for _, _, report in versioned_reports],
+                    dialect,
+                )
+            )
+            and not combined_versions_report.is_empty
+        }
+    else:
+        dialects_trend = {
+            dialect: latest_report
+            for _, dialect, latest_report in versioned_reports
+            if not latest_report.is_empty
+            and latest_report.implementations.get(id)
+        }
+
+    match format:
+        case "json":
+            serializable: Iterable[
+                tuple[
+                    ConnectableId,
+                    Iterable[tuple[str, Iterable[tuple[str, dict[str, int]]]]],
+                ]
+            ] = [
+                (
+                    id,
+                    [
+                        (
+                            dialect.short_name,
+                            [
+                                (
+                                    version or "latest",
+                                    {
+                                        "failed": len(unsuccessful.failed),
+                                        "errored": len(unsuccessful.errored),
+                                        "skipped": len(unsuccessful.skipped),
+                                    },
+                                )
+                                for version, unsuccessful in (
+                                    report.latest_to_oldest()
+                                    if versions
+                                    else [
+                                        (
+                                            report.implementations[id].version,
+                                            report.unsuccessful(id),
+                                        ),
+                                    ]
+                                )
+                            ],
+                        )
+                        for dialect, report in dialects_trend.items()
                     ],
                 ),
             ]
-            responses: AsyncIterator[tuple[TestCase, ReportableResult]] = (  # type: ignore[reportGeneralTypeIssues]  # noqa: E501
-                (case, await runner.run_case(seq=seq, case=case))
-                for seq, case in enumerate(cases)
+            click.echo(json.dumps(serializable, indent=2))
+        case "pretty":
+            STDOUT.print(
+                _trend_table_for(id, versions, dialects_trend),
+            )
+        case "markdown":
+            STDOUT.print(
+                _trend_table_in_markdown_for(id, versions, dialects_trend),
             )
 
-            if format == "json":
-                serializable = [
-                    {
-                        "case": case.without_expected_results(),
-                        "response": dict(
-                            errored=response.errored,
-                            failed=response.failed,
-                        ),
-                    }
-                    async for case, response in responses
-                ]
-                click.echo(json.dumps(serializable, indent=2))
-            else:
-                async for case, response in responses:
-                    if response.errored:  # type: ignore[reportGeneralTypeIssues]  # noqa: E501
-                        exit_code |= os.EX_DATAERR
-                        message = "❗ (error)"
-                    elif response.failed:  # type: ignore[reportGeneralTypeIssues]  # noqa: E501
-                        exit_code |= os.EX_DATAERR
-                        message = "✗ (failed)"
+
+@implementation_subcommand()  # type: ignore[reportArgumentType]
+@click.option(
+    "-q",
+    "--quiet",
+    "echo",
+    # I have no idea why Click makes this so hard, but no combination of:
+    #     type, default, is_flag, flag_value, nargs, ...
+    # makes this work without doing it manually with callback.
+    callback=lambda _, __, v: click.echo if not v else lambda *_, **__: None,  # type: ignore[reportUnknownLambdaType]
+    is_flag=True,
+    help="Don't print any output, just exit with nonzero status on failure.",
+)
+@format_option()
+async def smoke(start: Starter, format: _F, echo: Callable[..., None]) -> int:
+    """
+    Smoke test implementations for basic correctness against Bowtie's protocol.
+    """
+    results = [
+        (implementation.id, implementation.info, await implementation.smoke())
+        async for _, implementation in start()
+    ]
+
+    match results, format:
+        case [(_, _, result)], "json":
+            echo(json.dumps(result.serializable(), indent=2))
+        case _, "json":
+            output = {id: result.serializable() for id, _, result in results}
+            echo(json.dumps(output, indent=2))
+        case [(_, _, result)], "pretty":
+            STDOUT.print(result)
+        case _, "pretty":
+            for _, _, each in results:
+                STDOUT.print(each)
+        case _, "markdown":
+            for _, info, result in results:
+                echo(f"# {info.name} ({info.language})\n")
+
+                if result.success:
+                    echo("Smoke test *succeeded!*")
+                else:
+                    echo("Smoke test **failed!**")
+
+                epilog: Sequence[
+                    tuple[Dialect, Sequence[tuple[TestCase, SeqResult]]]
+                ] = []
+
+                echo("\n## Dialects\n")
+                for dialect, failures in result.for_each_dialect():
+                    if failures:
+                        epilog.append((dialect, failures))
+                        suffix = " **(failed)**"
                     else:
-                        message = "✓"
-                    click.echo(f"  {message}: {case.description}")
+                        suffix = ""
+                    echo(f"* {dialect.pretty_name}{suffix}")
 
-    if exit_code:
-        click.echo("\n❌ some failures", file=sys.stderr)
-    else:
-        click.echo("\n✅ all passed", file=sys.stderr)
+                if epilog:
+                    echo("\n## Failures\n")
 
-    return exit_code
+                    for dialect, failures in epilog:
+                        output = dedent(
+                            f"""
+                            <details>
+                            <summary>{dialect.pretty_name}</summary>
+                            """,
+                        )
+                        echo(output)
 
+                        for case, each in failures:
+                            output = dedent(
+                                f"""
+                                ### Schema
 
-class _TestSuiteCases(click.ParamType):
-    name = "json-schema-org/JSON-Schema-Test-Suite test cases"
+                                ```json
+                                {json.dumps(case.schema)}
+                                ```
 
-    def convert(
-        self,
-        value: Any,
-        param: click.Parameter | None,
-        ctx: click.Context | None,
-    ) -> tuple[Iterable[TestCase], str, dict[str, Any]]:
-        if not isinstance(value, str):
-            return value
+                                #### Instances
 
-        is_local_path = not value.casefold().startswith(TEST_SUITE_URL)
-        if is_local_path:
-            cases, dialect = self._cases_and_dialect(path=Path(value))
-            run_metadata = {}
-        else:
-            # Sigh. PyCQA/isort#1839
-            # isort: off
-            from github3 import (  # type: ignore[reportMissingTypeStubs]
-                GitHub,  # type: ignore[reportUnknownVariableType]
-            )
-            from github3.exceptions import NotFoundError  # type: ignore[reportMissingTypeStubs]  # noqa: E501
+                                """,
+                            )
+                            echo(output)
 
-            # isort: on
+                            # FIXME: This will be nicer if/when Unsuccessful
+                            #        contains the unsuccessful results.
+                            for i, test in enumerate(case.tests):
+                                result = each.result_for(i)
+                                if TestResult(valid=test.expected()) != result:  # type: ignore[reportArgumentType]
+                                    echo(f"* `{test.instance}`")
 
-            gh = GitHub()  # type: ignore[reportUnknownVariableType]  # noqa: E501
-            repo = gh.repository("json-schema-org", "JSON-Schema-Test-Suite")  # type: ignore[reportUnknownMemberType]  # noqa: E501
+                        echo("\n</details>")
 
-            _, _, rest = (
-                value[len(TEST_SUITE_URL) :].lstrip("/").partition("/")
-            )
-            ref, sep, partial = rest.partition("/tests")
-            data = BytesIO()
-            repo.archive(format="zipball", path=data, ref=ref)  # type: ignore[reportUnknownMemberType]  # noqa: E501
-            data.seek(0)
-            with zipfile.ZipFile(data) as zf:
-                (contents,) = zipfile.Path(zf).iterdir()
-                path = contents / sep.strip("/") / partial.strip("/")
-                cases, dialect = self._cases_and_dialect(path=path)
-                cases = list(cases)
-
-            try:
-                commit = repo.commit(ref)  # type: ignore[reportOptionalMemberAccess]  # noqa: E501
-            except NotFoundError:
-                commit_info = ref
-            else:
-                # TODO: Make this the tree URL maybe, but I see tree(...)
-                #       doesn't come with an html_url
-                commit_info = {"text": commit.sha, "href": commit.html_url}  # type: ignore[reportOptionalMemberAccess]  # noqa: E501
-            run_metadata: dict[str, Any] = {"Commit": commit_info}
-
-        if dialect is not None:
-            return cases, dialect, run_metadata
-
-        self.fail(
-            f"{value} does not contain JSON Schema Test Suite cases.",
-            param,
-            ctx,
-        )
-
-    def _cases_and_dialect(self, path: Any):
-        if path.name.endswith(".json"):
-            paths, version_path = [path], path.parent
-        else:
-            paths, version_path = _glob(path, "*.json"), path
-
-        remotes = version_path.parent.parent / "remotes"
-        cases = suite_cases_from(paths=paths, remotes=remotes)
-        dialect = DIALECT_SHORTNAMES.get(version_path.name)
-
-        return cases, dialect
+    return 0 if all(result.success for _, _, result in results) else EX.DATAERR
 
 
-@main.command()
-@click.pass_context
+@subcommand
 @IMPLEMENTATION
 @FILTER
-@FAIL_FAST
+@fail_fast
 @SET_SCHEMA
-@TIMEOUT
 @VALIDATE
-@click.argument("input", type=_TestSuiteCases())
+@click.argument("input", type=_suite.ClickParam(), metavar="DIALECT")
 def suite(
-    context: click.Context,
-    input: tuple[Iterable[TestCase], str, dict[str, Any]],
-    filter: str,
+    input: tuple[Iterable[TestCase], Dialect, dict[str, Any]],
+    filter: CaseTransform,
     **kwargs: Any,
 ):
     """
-    Run test cases from the official JSON Schema test suite.
+    Run the official JSON Schema test suite against any implementation.
 
-    Supports file or URL inputs like:
+    Supports a number of possible inputs:
 
-        * ``{ROOT}/tests/draft7`` to run a version's tests
+        * file paths found on the local file system containing tests, e.g.:
 
-        * ``{ROOT}/tests/draft7/foo.json`` to run just one file
+            - ``{PATH}/tests/draft7`` to run the draft 7 version's tests out of a local checkout of the test suite
 
-        * ``https://github.com/json-schema-org/JSON-Schema-Test-Suite/blob/main/tests/draft7/``
-          to run a version directly from a branch which exists in GitHub
+            - ``{PATH}/tests/draft7/foo.json`` to run just one file from a checkout
 
-        * ``https://github.com/json-schema-org/JSON-Schema-Test-Suite/blob/main/tests/draft7/foo.json``
-          to run a single file directly from a branch which exists in GitHub
+        * URLs to the test suite repository hosted on GitHub, e.g.:
+
+            - ``https://github.com/json-schema-org/JSON-Schema-Test-Suite/blob/main/tests/draft7/``
+              to run a version directly from any branch which exists in GitHub
+
+            - ``https://github.com/json-schema-org/JSON-Schema-Test-Suite/blob/main/tests/draft7/foo.json``
+              to run a single file directly from a branch which exists in GitHub
+
+        * short name versions of the previous URLs (similar to those providable
+          to `bowtie validate --dialect`, e.g.:
+
+            - ``7``, to run the draft 7 tests directly from GitHub (as in the
+              URL example above)
+
     """  # noqa: E501
-    cases, dialect, metadata = input
-    if filter:
-        cases = (case for case in cases if fnmatch(case.description, filter))
-
+    _cases, dialect, metadata = input
+    cases = filter(_cases)
     task = _run(**kwargs, dialect=dialect, cases=cases, run_metadata=metadata)
-    exit_code = asyncio.run(task)
-    context.exit(exit_code)
+    return asyncio.run(task)
 
 
 async def _run(
-    image_names: list[str],
+    connectables: Iterable[Connectable],
     cases: Iterable[TestCase],
-    dialect: str,
+    dialect: Dialect,
     fail_fast: bool,
-    set_schema: bool,
-    run_metadata: dict[str, Any] = {},  # noqa: B006
+    maybe_set_schema: Callable[[Dialect], CaseTransform],
+    max_fail: int | None = None,
+    max_error: int | None = None,
+    run_metadata: dict[str, Any] = {},
     reporter: _report.Reporter = _report.Reporter(),
     **kwargs: Any,
 ) -> int:
     exit_code = 0
-    acknowledged: list[Implementation] = []
+    acknowledged: Mapping[ConnectableId, ImplementationInfo] = {}
     runners: list[DialectRunner] = []
     async with _start(
-        image_names=image_names,
+        connectables=connectables,
         reporter=reporter,
         **kwargs,
     ) as starting:
-        reporter.will_speak(dialect=dialect)
-        for each in asyncio.as_completed(starting):
+        for each in starting:
             try:
-                implementation = await each
-            except StartupFailed as error:
-                exit_code = os.EX_CONFIG
-                reporter.startup_failed(name=error.name, stderr=error.stderr)
-                continue
-            except NoSuchImage as error:
-                exit_code = os.EX_CONFIG
-                reporter.no_such_image(name=error.name)
+                _, implementation = await each
+            except STARTUP_ERRORS as error:
+                exit_code |= EX.CONFIG
+                STDERR.print(error)
                 continue
 
             try:
-                if dialect in implementation.dialects:
-                    try:
-                        runner = await implementation.start_speaking(dialect)
-                    except GotStderr as error:
-                        exit_code = os.EX_CONFIG
-                        reporter.dialect_error(
-                            implementation=implementation,
-                            stderr=error.stderr.decode(),
-                        )
-                    else:
-                        runner.warn_if_unacknowledged(reporter=reporter)
-                        acknowledged.append(implementation)
-                        runners.append(runner)
-                else:
-                    reporter.unsupported_dialect(
-                        implementation=implementation,
-                        dialect=dialect,
-                    )
-            except StartupFailed as error:
-                exit_code = os.EX_CONFIG
-                reporter.startup_failed(name=error.name, stderr=error.stderr)
+                runner = await implementation.start_speaking(dialect)
+            except DialectError as error:
+                exit_code |= EX.CONFIG
+                STDERR.print(error)
+            except UnsupportedDialect as error:
+                STDERR.print(error)
+            else:
+                acknowledged[implementation.id] = implementation.info
+                runners.append(runner)
 
         if not runners:
-            exit_code = os.EX_CONFIG
-            reporter.no_implementations()
-        else:
-            reporter.ready(
-                _report.RunInfo.from_implementations(
-                    implementations=acknowledged,
-                    dialect=dialect,
-                    metadata=run_metadata,
-                ),
+            STDERR.print(
+                "[bold red]No implementations started successfully![/]",
             )
+            return exit_code | EX.CONFIG
 
-            seq = 0
-            should_stop: bool = False
-            for seq, case, case_reporter in sequenced(cases, reporter):
-                if set_schema and not isinstance(case.schema, bool):
-                    case.schema["$schema"] = dialect
+        reporter.ready(
+            _report.RunMetadata(
+                implementations=acknowledged,
+                dialect=dialect,
+                metadata=run_metadata,
+            ),
+        )
 
-                responses: Iterable[Awaitable[ReportableResult]] = [
-                    each.run_case(seq=seq, case=case) for each in runners
-                ]
-                for each in asyncio.as_completed(responses):
-                    response = await each
-                    response.report(reporter=case_reporter)
+        count = 0
+        should_stop = False
+        unsucessful = Unsuccessful()
 
-                    if fail_fast:
-                        # Stop after this case, since we still have futures out
-                        # TODO: Combine this with the logic in the template
-                        should_stop = response.errored or response.failed  # type: ignore[reportGeneralTypeIssues]  # noqa: E501
+        # Just to complement bowtie perf (not for other purposes)
+        time_taken_by_implementations = 0
+        time_output_file = (
+            Path(os.environ["TIME_OUTPUT_FILE"])
+            if "TIME_OUTPUT_FILE" in os.environ
+            else None
+        )
 
-                if should_stop:
-                    break
-            reporter.finished(count=seq, did_fail_fast=should_stop)  # type: ignore[reportUnknownArgumentType]  # noqa: E501
-            if not seq:
-                exit_code = os.EX_NOINPUT
+        for count, case in enumerate(maybe_set_schema(dialect)(cases), 1):
+            seq_case = SeqCase(seq=count, case=case)
+            got_result = reporter.case_started(seq_case, dialect)
+
+            responses = [seq_case.run(runner=runner) for runner in runners]
+            st_time = perf_counter_ns()
+
+            for each in asyncio.as_completed(responses):
+                result = await each
+                got_result(result=result)
+                unsucessful += result.unsuccessful()
+                time_taken_by_implementations += perf_counter_ns() - st_time
+                if (max_fail and len(unsucessful.failed) >= max_fail) or (
+                    max_error and len(unsucessful.errored) >= max_error
+                ):
+                    should_stop = True
+
+            if should_stop:
+                STDERR.print(
+                    "[bold yellow]Stopping -- the maximum number of "
+                    "unsuccessful tests was reached![/]",
+                )
+                break
+        reporter.finished(did_fail_fast=should_stop)
+        if count == 0:
+            exit_code |= EX.NOINPUT
+            STDERR.print("[bold red]No test cases ran.[/]")
+        elif count > 1:  # XXX: Ugh, this should be removed when Reporter dies
+            STDERR.print(f"Ran [green]{count}[/] test cases.")
+
+        if time_output_file:
+            with time_output_file.open("a") as file:
+                file.write(f"{time_taken_by_implementations}\n")
+
     return exit_code
 
 
 @asynccontextmanager
-async def _start(image_names: Iterable[str], **kwargs: Any):
+async def _start(
+    connectables: Iterable[Connectable],
+    **kwargs: Any,
+):
+    async def _connected(
+        connectable: Connectable,
+        **kwargs: Any,
+    ):
+        implementation = await stack.enter_async_context(
+            connectable.connect(**kwargs),
+        )
+        return connectable.to_terse(), implementation
+
     async with AsyncExitStack() as stack:
-        docker = await stack.enter_async_context(aiodocker.Docker())
-
-        yield [
-            stack.enter_async_context(
-                Implementation.start(
-                    docker=docker,
-                    image_name=image_name,
-                    **kwargs,
-                ),
-            )
-            for image_name in image_names
-        ]
-
-
-def sequenced(
-    cases: Iterable[TestCase],
-    reporter: _report.Reporter,
-) -> Iterable[tuple[int, TestCase, _report._CaseReporter]]:  # type: ignore[reportPrivateUsage]  # noqa: E501
-    for seq, case in enumerate(cases, 1):
-        yield seq, case, reporter.case_started(seq=seq, case=case)
-
-
-def suite_cases_from(paths: Iterable[_P], remotes: Path) -> Iterable[TestCase]:
-    for path in paths:
-        if _stem(path) in {"refRemote", "dynamicRef", "vocabulary"}:
-            registry = {
-                urljoin(
-                    "http://localhost:1234",
-                    str(_relative_to(each, remotes)).replace("\\", "/"),
-                ): json.loads(each.read_text())
-                for each in _rglob(remotes, "*.json")
-            }
-        else:
-            registry = {}
-
-        for case in json.loads(path.read_text()):
-            for test in case["tests"]:
-                test["instance"] = test.pop("data")
-            yield TestCase.from_dict(**case, registry=registry)
+        yield asyncio.as_completed(
+            [_connected(each, **kwargs) for each in connectables],
+        )
 
 
 def _stderr_processor(file: TextIO) -> structlog.typing.Processor:
@@ -883,7 +2677,7 @@ def _stderr_processor(file: TextIO) -> structlog.typing.Processor:
     return stderr_processor
 
 
-def redirect_structlog(file: TextIO = sys.stderr):
+def _redirect_structlog(log_level: int, file: TextIO = sys.stderr):
     """
     Reconfigure structlog's defaults to go to the given location.
     """
@@ -901,35 +2695,6 @@ def redirect_structlog(file: TextIO = sys.stderr):
                 colors=getattr(file, "isatty", lambda: False)(),
             ),
         ],
-        logger_factory=structlog.PrintLoggerFactory(file),
+        logger_factory=structlog.WriteLoggerFactory(file),
+        wrapper_class=structlog.make_filtering_bound_logger(log_level),
     )
-
-
-_P = Union[Path, zipfile.Path]
-
-
-# Missing zipfile.Path methods...
-def _glob(path: _P, path_pattern: str) -> Iterable[_P]:
-    return (  # It's missing .match() too, so we fnmatch directly
-        each for each in path.iterdir() if fnmatch(each.name, path_pattern)
-    )
-
-
-def _rglob(path: _P, path_pattern: str) -> Iterable[_P]:
-    for each in path.iterdir():
-        if fnmatch(each.name, path_pattern):
-            yield each
-        elif each.is_dir():
-            yield from _rglob(each, path_pattern)
-
-
-def _relative_to(path: _P, other: Path) -> Path:
-    if hasattr(path, "relative_to"):
-        return path.relative_to(other)  # type: ignore[reportGeneralTypeIssues]
-    return Path(path.at).relative_to(other.at)  # type: ignore[reportUnknownArgumentType, reportUnknownMemberType]  # noqa: E501
-
-
-def _stem(path: _P) -> str:  # Missing on < 3.11
-    if hasattr(path, "stem"):
-        return path.stem
-    return Path(path.at).stem  # type: ignore[reportUnknownArgumentType, reportUnknownMemberType]  # noqa: E501

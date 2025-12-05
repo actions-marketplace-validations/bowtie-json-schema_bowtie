@@ -1,23 +1,20 @@
-use std::{collections::HashMap, io, process, sync::Arc};
+use std::{collections::HashMap, io, process};
 
 use backtrace::Backtrace;
 use serde_json::{json, Result};
-use url::Url;
 
-use jsonschema::{Draft, JSONSchema, SchemaResolver, SchemaResolverError};
+use jsonschema::{Draft, Retrieve, Uri};
 
-struct InMemoryResolver {
+struct InMemoryRetriever {
     registry: serde_json::Value,
 }
 
-impl SchemaResolver for InMemoryResolver {
-    fn resolve(
+impl Retrieve for InMemoryRetriever {
+    fn retrieve(
         &self,
-        _root_schema: &serde_json::Value,
-        url: &Url,
-        _original_reference: &str,
-    ) -> core::result::Result<Arc<serde_json::Value>, SchemaResolverError> {
-        return Ok(Arc::new(self.registry[url.to_string()].to_owned()));
+        uri: &Uri<String>,
+    ) -> std::result::Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.registry[uri.as_str()].to_owned())
     }
 }
 
@@ -46,26 +43,27 @@ fn main() -> Result<()> {
     ]);
 
     let mut started = false;
-    let mut options = JSONSchema::options();
-    let mut compiler = options.with_draft(Draft::Draft202012);
+    let mut options = jsonschema::options().with_draft(Draft::Draft202012);
 
     for line in io::stdin().lines() {
         let request: serde_json::Value = serde_json::from_str(&line.expect("No input!"))?;
         match request["cmd"].as_str().expect("Bad command!") {
             "start" => {
+                let osinfo = os_info::get();
                 started = true;
                 if request["version"] != 1 {
                     panic!("Not version 1!")
                 };
                 let response = json!({
-                    "ready": true,
                     "version": 1,
                     "implementation": {
                         "language": "rust",
                         "name": "jsonschema",
                         "version": env!("JSONSCHEMA_VERSION"),
-                        "homepage": "https://docs.rs/jsonschema/latest/jsonschema/",
+                        "homepage": "https://docs.rs/jsonschema",
+                        "documentation": "https://docs.rs/jsonschema",
                         "issues": "https://github.com/Stranger6667/jsonschema-rs/issues",
+                        "source": "https://github.com/Stranger6667/jsonschema-rs",
 
                         "dialects": [
                             "https://json-schema.org/draft/2020-12/schema",
@@ -74,19 +72,22 @@ fn main() -> Result<()> {
                             "http://json-schema.org/draft-06/schema#",
                             "http://json-schema.org/draft-04/schema#",
                         ],
+                        "os": osinfo.os_type(),
+                        "os_version": osinfo.version().to_string(),
+                        "language_version": rustc_version_runtime::version().to_string(),
                     },
                 });
-                println!("{}", response.to_string());
+                println!("{}", response);
             }
             "dialect" => {
                 if !started {
                     panic!("Not started!")
                 };
                 let dialect = request["dialect"].as_str().expect("Bad dialect!");
-                options = JSONSchema::options();
-                compiler = options.with_draft(*dialects.get(dialect).expect("No such draft!"));
+                options = jsonschema::options()
+                    .with_draft(*dialects.get(dialect).expect("No such draft!"));
                 let response = json!({"ok": true});
-                println!("{}", response.to_string());
+                println!("{}", response);
             }
             "run" => {
                 if !started {
@@ -95,12 +96,12 @@ fn main() -> Result<()> {
                 let case = &request["case"];
 
                 let registry = &case["registry"];
-                let resolver = InMemoryResolver {
+                let retriever = InMemoryRetriever {
                     registry: registry.to_owned(),
                 };
-                compiler = compiler.with_resolver(resolver);
+                options = options.with_retriever(retriever);
 
-                let response = match compiler.compile(&case["schema"]) {
+                let response = match options.build(&case["schema"]) {
                     Ok(compiled) => {
                         let results: Vec<_> = case["tests"]
                             .as_array()
@@ -119,7 +120,7 @@ fn main() -> Result<()> {
                         },
                     }),
                 };
-                println!("{}", response.to_string());
+                println!("{}", response);
             }
             "stop" => {
                 if !started {

@@ -12,17 +12,20 @@
           (case (request "cmd")
             "start" (do (assert (= (request "version") 1) "Not version 1!")
                         (reset! started true)
-                        {:ready true
-                         :version 1
+                        {:version 1
                          :implementation
                          {:language :clojure
                           :name :json-schema
                           :homepage "https://github.com/luposlip/json-schema"
                           :issues "https://github.com/luposlip/json-schema/issues"
+                          :source "https://github.com/luposlip/json-schema"
 
                           :dialects ["http://json-schema.org/draft-07/schema#",
                                      "http://json-schema.org/draft-06/schema#",
-                                     "http://json-schema.org/draft-04/schema#"]}})
+                                     "http://json-schema.org/draft-04/schema#"]
+                          :os (System/getProperty "os.name")
+                          :os_version (System/getProperty "os.version")
+                          :language_version (clojure-version)}})
             "dialect" (do (assert @started "Not started!")
                           {:ok false})
             "run" (do (assert @started "Not started!")

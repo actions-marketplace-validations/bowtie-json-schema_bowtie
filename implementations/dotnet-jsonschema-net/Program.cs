@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Reflection;
@@ -26,7 +27,7 @@ var unsupportedTests =
                                "always invalid, but naive implementations may raise an overflow error")] =
                                  "System.Decimal does not support large values like 1e308" };
 
-while (cmdSource.GetNextCommand() is {} line && line != "")
+while (cmdSource.GetNextCommand() is { } line && line != "")
 {
     var root = JsonNode.Parse(line);
     var cmd = root["cmd"].GetValue<string>();
@@ -40,24 +41,25 @@ while (cmdSource.GetNextCommand() is {} line && line != "")
             }
             started = true;
             var startResult = new JsonObject {
-                ["ready"] = true,
                 ["version"] = 1,
                 ["implementation"] =
-                    new JsonObject {
-                        ["language"] = "dotnet",
-                        ["name"] = "JsonSchema.Net",
-                        ["version"] = GetLibVersion(),
-                        ["homepage"] = "https://json-everything.net/json-schema/",
-                        ["issues"] = "https://github.com/gregsdennis/json-everything/issues",
+                    new JsonObject { ["language"] = "dotnet", ["name"] = "JsonSchema.Net",
+                                     ["version"] = GetLibVersion(),
+                                     ["homepage"] = "https://json-everything.net/json-schema/",
+                                     ["documentation"] = "https://docs.json-everything.net/schema/basics/",
+                                     ["issues"] = "https://github.com/gregsdennis/json-everything/issues",
+                                     ["source"] = "https://github.com/gregsdennis/json-everything",
 
-                        ["dialects"] =
-                            new JsonArray {
-                                "https://json-schema.org/draft/2020-12/schema",
-                                "https://json-schema.org/draft/2019-09/schema",
-                                "http://json-schema.org/draft-07/schema#",
-                                "http://json-schema.org/draft-06/schema#",
-                            },
-                    },
+                                     ["dialects"] =
+                                         new JsonArray {
+                                             "https://json-schema.org/draft/2020-12/schema",
+                                             "https://json-schema.org/draft/2019-09/schema",
+                                             "http://json-schema.org/draft-07/schema#",
+                                             "http://json-schema.org/draft-06/schema#",
+                                         },
+                                     ["os"] = Environment.OSVersion.Platform.ToString(),
+                                     ["os_version"] = Environment.OSVersion.Version.ToString(),
+                                     ["language_version"] = Environment.Version.ToString() },
             };
             Console.WriteLine(startResult.ToJsonString());
             break;
@@ -84,13 +86,17 @@ while (cmdSource.GetNextCommand() is {} line && line != "")
             }
 
             var testCase = root["case"];
+            var seq = root["seq"].DeepClone();
             var testCaseDescription = testCase["description"].GetValue<string>();
             string? testDescription = null;
             var schemaText = testCase["schema"];
-            var registry = testCase["registry"];
 
-            options.SchemaRegistry.Fetch = uri =>
-            { return registry[uri.ToString()].Deserialize<JsonSchema>(); };
+            JsonNode? nullableRegistry = testCase["registry"];
+            if (nullableRegistry is not null)
+            {
+                var registry = nullableRegistry.AsObject().ToDictionary(x => new Uri(x.Key), x => x.Value);
+                options.SchemaRegistry.Fetch = uri => registry[uri].Deserialize<JsonSchema>();
+            }
 
             var schema = schemaText.Deserialize<JsonSchema>();
             var tests = testCase["tests"].AsArray();
@@ -102,13 +108,13 @@ while (cmdSource.GetNextCommand() is {} line && line != "")
                 foreach (var test in tests)
                 {
                     testDescription = test["description"].GetValue<string>();
-                    var validationResult = schema.Validate(test["instance"], options);
+                    var validationResult = schema.Evaluate(test["instance"], options);
                     var testResult = JsonSerializer.SerializeToNode(validationResult);
                     results.Add(testResult);
                 }
 
                 var runResult = new JsonObject {
-                    ["seq"] = root["seq"].GetValue<int>(),
+                    ["seq"] = seq,
                     ["results"] = results,
                 };
                 Console.WriteLine(runResult.ToJsonString());
@@ -116,14 +122,13 @@ while (cmdSource.GetNextCommand() is {} line && line != "")
             catch (Exception)
                 when (unsupportedTests.TryGetValue((testCaseDescription, testDescription), out var message))
             {
-                var skipResult =
-                    new JsonObject { ["seq"] = root["seq"].GetValue<int>(), ["skipped"] = true, ["message"] = message };
+                var skipResult = new JsonObject { ["seq"] = seq, ["skipped"] = true, ["message"] = message };
                 Console.WriteLine(skipResult.ToJsonString());
             }
             catch (Exception e)
             {
                 var errorResult = new JsonObject {
-                    ["seq"] = root["seq"].GetValue<int>(),
+                    ["seq"] = seq,
                     ["errored"] = true,
                     ["context"] =
                         new JsonObject {
@@ -154,7 +159,7 @@ while (cmdSource.GetNextCommand() is {} line && line != "")
 static string GetLibVersion()
 {
     var attribute = typeof(JsonSchema).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>();
-    return Regex.Match(attribute!.InformationalVersion, @"\d+\.\d+\.\d+").Value;
+    return Regex.Match(attribute!.InformationalVersion, @"\d+(\.\d+)+").Value;
 }
 
 class UnknownCommand : Exception

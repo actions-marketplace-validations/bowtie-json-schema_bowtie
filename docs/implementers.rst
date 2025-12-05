@@ -1,6 +1,6 @@
-==================================
-Tutorial: Adding An Implementation
-==================================
+===========================
+Adding a New Implementation
+===========================
 
 The purpose of `Bowtie` is to support passing :term:`instances <instance>` and :term:`schemas <schema>` through a large number of JSON Schema implementations, collecting their output for comparison.
 
@@ -8,7 +8,17 @@ If you've written or used an implementation of JSON Schema which isn't already s
 
 Bowtie orchestrates running a number of containers, passing JSON Schema test cases to each one of them, and then collecting and comparing results across implementations.
 Any JSON Schema implementation will have some way of getting schemas and instances "into" it for processing.
-We'll wrap this implementation-specific API inside a small harness which accepts input from Bowtie over standard input and writes results to standard output in the format Bowtie expects.
+We'll wrap this implementation-specific API inside a small harness which accepts input from Bowtie over standard input and writes results to standard output in the format Bowtie expects, as shown below:
+
+.. image:: _static/bowtie_diagram_light.svg
+    :class: only-light
+    :width: 80 %
+    :align: center
+
+.. image:: _static/bowtie_diagram_dark.svg
+    :class: only-dark
+    :width: 80 %
+    :align: center
 
 As a last step before we get into details, let's summarize some terminology (which you can also skip and refer back to if needed):
 
@@ -61,6 +71,13 @@ Once you've installed the prerequisites, your first step is to ensure you're fam
 If you're its author, you're certainly well qualified :) -- if not, you'll see a few things below which you'll need to find in its API documentation, such as what function(s) or object(s) you use to validate instances under schemas.
 If you're not, there shouldn't be a need to be an expert neither in the language nor implementation, as we'll be writing only a small wrapper program, but you definitely will need to know how to compile or run programs in the host language, how to read and write JSON from it, and how to package programs into container images.
 
+.. sidebar:: JSON Schema Implementation "Architectures"
+
+    Most implementations of JSON Schema use a "runtime-compile-and-validate" architecture where at runtime a schema is turned into a callable which can be used to validate other language-level objects.
+    In particular, they do *not* involve a separate out-of-band compilation process where a schema is turned into a compiled artifact that no longer references general JSON Schema behavior.
+
+    Bowtie certainly aims to support all implementations and architectures, so if you're writing a harness for a drastically different architecture, you'll need to adjust what is below to suit.
+
 For the purposes of this tutorial, we'll write support for a :github:`Lua implementation of JSON Schema <api7/jsonschema>` (one which calls itself simply ``jsonschema`` within the Lua ecosystem, as many implementations tend to).
 Bowtie of course already supports this implementation officially, so if you want to see the final result either now or at the end of this tutorial, it's :gh:`here <tree/main/implementations/lua-jsonschema>`.
 If you're not already familiar with Lua as a programming language, the below won't serve as a full tutorial of course, but you still should be able to follow along; it's a fairly simple one.
@@ -69,22 +86,14 @@ Let's get a Hello World container running which we'll turn into our test harness
 
 Create a directory somewhere, and within it create a ``Dockerfile`` with these contents:
 
-.. code:: dockerfile
+.. literalinclude:: ../implementations/lua-jsonschema/Dockerfile
+    :language: Dockerfile
+    :emphasize-lines: 1,8,10-12
 
-    FROM alpine:3.16
-    RUN apk add --no-cache luajit luajit-dev pcre-dev gcc libc-dev curl make cmake && \
-        wget 'https://luarocks.org/releases/luarocks-3.9.1.tar.gz' && \
-        tar -xf luarocks-3.9.1.tar.gz && cd luarocks-3.9.1 && \
-        ./configure && make && make install
-    RUN sed -i '/WGET/d' /usr/local/share/lua/5.1/luarocks/fs/tools.lua
-    RUN luarocks install jsonschema
-    ADD https://raw.githubusercontent.com/rxi/json.lua/master/json.lua .
-    COPY bowtie_jsonschema.lua .
-    CMD ["luajit", "bowtie_jsonschema.lua"]
+Most of the above is slightly *more* complicated than you're likely to need for your own language, and has to do with some Lua-specific issues that are uninteresting to discuss in detail (which essentially relate to installing Lua's package manager and a library for JSON serialization).
 
-Most of the above is slightly *more* complicated than one you'll need to write for your own language, and has to do with some Lua packaging issues that are uninteresting to discuss in detail.
-The notable bit is we'll create a ``bowtie_jsonschema.lua`` file, our test harness, and then this container image will invoke it.
-Bowtie will then speak to the running harness container.
+The notable bit is we'll install our implementation and create a ``bowtie_jsonschema.lua`` file which is our test harness.
+Our container image will invoke the harness, and Bowtie will later speak to the running container.
 
 Let's check everything works.
 Create a file named ``bowtie_jsonschema.lua`` with these contents:
@@ -97,7 +106,15 @@ and build the image (below using ``podman`` but if you're using ``docker``, just
 
 .. code:: sh
 
-    podman build --quiet -f Dockerfile -t bowtie-lua-jsonschema
+    podman build --quiet -f Dockerfile -t bowtie-lua-jsonschema .
+
+.. note::
+
+    If you are indeed using ``podman``, you must ensure you have set the ``DOCKER_HOST`` environment variable in the environment in which you invoke ``bowtie``.
+
+    This ensures ``bowtie`` can speak the Docker API to your ``podman`` installation (which is needed because the API client used within Bowtie is agnostic, but speaks the Docker API, which ``podman`` supports as well).
+
+    Further information may be found `here <https://podman-desktop.io/docs/migrating-from-docker/using-the-docker_host-environment-variable>`_.
 
 If everything went well, running:
 
@@ -124,7 +141,7 @@ Additional properties are arguments to the request.
 
 There are 4 commands every harness must know how to respond to, shown here as a brief excerpt from the full schema specifying the protocol:
 
-.. literalinclude:: ../bowtie/schemas/io-schema.json
+.. literalinclude:: ../bowtie/schemas/io/v1.json
     :language: json
     :start-at: oneOf
     :end-at: ]
@@ -141,7 +158,7 @@ Let's start filling out a real test harness implementation by at least reacting 
 
     .. code:: sh
 
-        podman build -f Dockerfile -t localhost/tutorial-lua-jsonschema
+        podman build -f Dockerfile -t localhost/tutorial-lua-jsonschema .
 
 Change your harness to contain:
 
@@ -174,7 +191,7 @@ If this is your first time reading Lua code, what we've done is create a dispatc
 .. note::
 
     We also have configured ``stdout`` for the harness to be line-buffered (by calling ``setvbuf``).
-    Ensure you've done the equivalent for your host language, as Bowtie expects to be able to read responses to each message it sends.
+    Ensure you've done the equivalent for your host language, as Bowtie expects to be able to read responses to each message it sends even though some languages do not necessarily flush their output on each line write.
 
 Any other command other than ``start`` or ``stop`` will blow up, but we're reading and writing JSON!
 
@@ -192,7 +209,7 @@ We can pass a hand-crafted `test case` to Bowtie by running:
 
 which if you now run should produce something like::
 
-    2022-10-05 15:39.59 [info     ] Will speak dialect             dialect=https://json-schema.org/draft/2020-12/schema
+    2022-10-05 15:39.59 [debug    ] Will speak dialect             dialect=https://json-schema.org/draft/2020-12/schema
     Traceback (most recent call last):
         ...
     TypeError: bowtie._commands.Started() argument after ** must be a mapping, not list
@@ -208,7 +225,7 @@ You can enable this validation by passing :program:`bowtie run` the :option:`-V`
     {"description": "test case 1", "schema": {}, "tests": [{"description": "a test", "instance": {}}] }
     {"description": "test case 2", "schema": {"const": 37}, "tests": [{"description": "not 37", "instance": {}}, {"description": "is 37", "instance": 37}] }
     EOF
-    2022-10-05 20:59.41 [info     ] Will speak dialect             dialect=https://json-schema.org/draft/2020-12/schema
+    2022-10-05 20:59.41 [debug    ] Will speak dialect             dialect=https://json-schema.org/draft/2020-12/schema
     2022-10-05 20:59.41 [error    ] Invalid response               [localhost/tutorial-lua-jsonschema] errors=[<ValidationError: "[] is not of type 'object'">] request=Start(version=1)
     2022-10-05 20:59.45 [warning  ] Unsupported dialect, skipping implementation. [localhost/tutorial-lua-jsonschema] dialect=https://json-schema.org/draft/2020-12/schema
     {"implementations": {}}
@@ -221,9 +238,8 @@ Lua the language has only one container type (``table``), and we've returned ``{
 Don't think too hard about Lua's peculiarities, let's just fix it by having a look at what parameters the ``start`` command sends a harness and what it expects back.
 The schema says:
 
-.. literalinclude:: ../bowtie/schemas/io-schema.json
+.. literalinclude:: ../bowtie/schemas/io/commands/start.json
     :language: json
-    :start-at: "start"
     :end-before: "$defs"
     :dedent:
 
@@ -233,12 +249,11 @@ so ``start`` requests will have two parameters:
     * ``version`` which represents the version of the Bowtie protocol being spoken.
       Today, that version is always ``1``, but that may change in the future, in which case a harness should bail out as it may not understand the requests being sent.
 
-The harness is expected to respond with:
+The harness is expected to respond with something conforming to:
 
-.. literalinclude:: ../bowtie/schemas/io-schema.json
+.. literalinclude:: ../bowtie/schemas/io/commands/start.json
     :language: json
     :start-at: "response"
-    :end-before: "dialect"
     :dedent:
 
 which is some metadata about the implementation being tested, and includes things like:
@@ -252,6 +267,8 @@ You can also have a look at the full schema for details on the ``stop`` command,
 Let's implement both requests.
 Change your harness to contain:
 
+.. _start_implementation:
+
 .. code:: lua
 
     local json = require 'json'
@@ -263,13 +280,13 @@ Change your harness to contain:
         assert(request.version == 1, 'Wrong version!')
         STARTED = true
         return {
-          ready = true,
           version = 1,
           implementation = {
             language = 'lua',
             name = 'jsonschema',
             homepage = 'https://github.com/api7/jsonschema',
             issues = 'https://github.com/api7/jsonschema/issues',
+            source = 'https://github.com/api7/jsonschema',
 
             dialects = {
               'http://json-schema.org/draft-07/schema#',
@@ -298,7 +315,7 @@ When stopping, we simply exit successfully.
 
 If you re-run ``bowtie``, you'll see now that it doesn't crash, though it outputs::
 
-    2022-10-11 13:44.40 [info     ] Will speak dialect             dialect=https://json-schema.org/draft/2020-12/schema
+    2022-10-11 13:44.40 [debug    ] Will speak dialect             dialect=https://json-schema.org/draft/2020-12/schema
     2022-10-11 13:44.40 [warning  ] Unsupported dialect, skipping implementation. [localhost/tutorial-lua-jsonschema] dialect=https://json-schema.org/draft/2020-12/schema
     {"implementations": {}}
 
@@ -311,7 +328,7 @@ Tell Bowtie we are speaking an earlier version by passing the :option:`--dialect
 
 If we yet again invoke ``bowtie``, we now see something like::
 
-    2022-10-31 12:26.05 [info     ] Will speak dialect             dialect=http://json-schema.org/draft-07/schema#
+    2022-10-31 12:26.05 [debug    ] Will speak dialect             dialect=http://json-schema.org/draft-07/schema#
     ╭───────────── localhost/tutorial-lua-jsonschema (stderr) ─────────────╮
     │                                                                      │
     │    luajit: bowtie_jsonschema.lua:35: attempt to call a nil value     │
@@ -328,14 +345,13 @@ which is indicating that we have yet another command to implement -- the ``diale
 Step 2: Configuring Implicit Dialects
 -------------------------------------
 
-The JSON Schema specification (in at least some dialects) allows schemas of the form ``{"type": "object"}`` -- i.e. where the schema does not include a :kw:`$schema` property which indicates the dialect of JSON Schema being used.
+The JSON Schema specification generally allows schemas of the form ``{"type": "object"}`` -- i.e. ones where the schema does not internally include a :kw:`$schema` keyword which would otherwise indicate the dialect of JSON Schema being used.
 In other words, the aforementioned schema may be treated (depending on its author's intention) as a Draft 4 schema, a Draft 7 schema, a Draft 2020-12 schema, etc.
-Bowtie enables specifying an intended behavior for such schemas by communicating it "out-of-band" to harnesses via the ``dialect`` command, which indicates to the harness "treat schemas without ``$schema`` as this particular dialect (provided in the request)".
+Bowtie enables specifying an intended behavior for such schemas by communicating it "out-of-band" to harnesses via the ``dialect`` command, which indicates to the harness: "treat schemas without ``$schema`` as this particular dialect (provided in the request)".
 The structure of this command looks like:
 
-.. literalinclude:: ../bowtie/schemas/io-schema.json
+.. literalinclude:: ../bowtie/schemas/io/commands/dialect.json
     :language: json
-    :start-at: "dialect"
     :end-before: "$defs"
     :dedent:
 
@@ -357,9 +373,21 @@ Add a handler for the ``dialect`` command to your harness which returns that res
       return { ok = false }
     end,
 
+.. warning::
+
+    Responding ``{"ok": true}`` or ``false`` is *not* an indication of whether an implementation supports the dialect sent.
+
+    Bowtie will never send a dialect request for a dialect that a harness does not support -- information which it already knows from the ``start`` response we implemented `earlier <start_implementation>`, where we specified the complete list of supported dialects for the implementation.
+    If it ever did so this would be considered a Bowtie bug.
+
+    This ``dialect`` request *strictly* controls setting what an implementation harness should do with schemas that do *not* internally indicate what version they are written for; its response should signal only whether the implementation has configured itself appropriately or whether doing so is not supported.
+
+    Bowtie will *continue executing tests* even if it sees a ``false`` response.
+
+
 Running ``bowtie`` now should produce::
 
-    2022-10-31 13:04.51 [info     ] Will speak dialect             dialect=http://json-schema.org/draft-07/schema#
+    2022-10-31 13:04.51 [debug    ] Will speak dialect             dialect=http://json-schema.org/draft-07/schema#
     2022-10-31 13:04.52 [warning  ] Implicit dialect not acknowledged. Proceeding, but implementation may not have configured itself to handle schemas without $schema. [localhost/tutorial-lua-jsonschema] dialect=http://json-schema.org/draft-07/schema# response=StartedDialect(ok=False)
     {"implementations": {"localhost/tutorial-lua-jsonschema": {"language": "lua", "name": "jsonschema", "homepage": "https://github.com/api7/jsonschema", "issues": "https://github.com/api7/jsonschema/issues", "dialects": ["http://json-schema.org/draft-07/schema#", "http://json-schema.org/draft-06/schema#", "http://json-schema.org/draft-04/schema#"], "image": "localhost/tutorial-lua-jsonschema"}}}
     {"case": {"description": "test case 1", "schema": {}, "tests": [{"description": "a test", "instance": {}, "valid": null}], "comment": null, "registry": null}, "seq": 1}
@@ -404,9 +432,8 @@ For details on how to use this API, see `the library's documentation <https://gi
 It returns a callable which then can be used to validate instances (other Lua values).
 Let's take a first pass at implementing the ``run`` command, whose input looks like:
 
-.. literalinclude:: ../bowtie/schemas/io-schema.json
+.. literalinclude:: ../bowtie/schemas/io/commands/run.json
     :language: json
-    :start-at: "run"
     :end-before: "$defs"
     :dedent:
 
@@ -426,12 +453,12 @@ Here's an implementation of the ``run`` command to add to our harness implementa
       return { seq = request.seq, results = results }
     end,
 
-We call ``generate_validator`` to get our validation callable, then we apply it (``map`` it, though Lua has no builtin to do so) over all tests in the ``run`` request, returning a response which contains the ``seq`` number alongside results for each test.
+We call ``generate_validator`` to get our validation callable, then we apply it (``map`` it, though Lua has no builtin to do so) over all tests in the ``run`` request, returning a response which contains the ``seq`` alongside results for each test.
 The results are indicated positionally as shown above, meaning the first result in the results array should be the result for the first test in the input array.
 
 If we run ``bowtie`` again, we see::
 
-    2022-10-31 13:20.14 [info     ] Will speak dialect             dialect=http://json-schema.org/draft-07/schema#
+    2022-10-31 13:20.14 [debug    ] Will speak dialect             dialect=http://json-schema.org/draft-07/schema#
     2022-10-31 13:20.14 [warning  ] Implicit dialect not acknowledged. Proceeding, but implementation may not have configured itself to handle schemas without $schema. [localhost/tutorial-lua-jsonschema] dialect=http://json-schema.org/draft-07/schema# response=StartedDialect(ok=False)
     {"implementations": {"localhost/tutorial-lua-jsonschema": {"dialects": ["http://json-schema.org/draft-07/schema#", "http://json-schema.org/draft-06/schema#", "http://json-schema.org/draft-04/schema#"], "language": "lua", "name": "jsonschema", "homepage": "https://github.com/api7/jsonschema", "issues": "https://github.com/api7/jsonschema/issues", "image": "localhost/tutorial-lua-jsonschema"}}}
     {"case": {"description": "test case 1", "schema": {}, "tests": [{"description": "a test", "instance": {}, "valid": null}], "comment": null, "registry": null}, "seq": 1}
@@ -441,8 +468,13 @@ If we run ``bowtie`` again, we see::
     2022-10-31 13:20.14 [info     ] Finished                       count=2
 
 where we've now successfully run some inputted test cases.
-The output we see now contains the results returned by the Lua implementation and is ready to be piped into `bowtie report <cli:report>`.
+The output we see now contains the results returned by the Lua implementation and is ready to be piped into `bowtie summary <cli:summary>`.
 Hooray!
+
+.. note:: Pay no attention to the man behind the curtain!
+
+   The ``seq`` parameter has no public type other than "JSON value".
+   In other words, when writing your harness, you should make no assumption whatsoever about what kind of value it is!
 
 Step 4: Resolving References
 ----------------------------
@@ -494,10 +526,9 @@ Catching exceptions from our Lua implementation is simple, by wrapping the ``val
 Once the harness detects an error, it should return an error response (in place of results), which may include any diagnostic information for later use, e.g. a traceback or internal error message.
 The structure of error responses is:
 
-.. literalinclude:: ../bowtie/schemas/io-schema.json
+.. literalinclude:: ../bowtie/schemas/io/commands/run.json
     :language: json
     :start-at: "errored": {
-    :end-before: "stop"
     :dedent:
 
 (i.e. in particular the harness should return a response setting ``errored`` to ``true``).
@@ -514,7 +545,7 @@ Support for skipping tests is still somewhat crude, but it does indeed work, and
 
 The structure of skip responses, which you should send when presented with a "known" unsupported test, is:
 
-.. literalinclude:: ../bowtie/schemas/io-schema.json
+.. literalinclude:: ../bowtie/schemas/io/commands/run.json
     :language: json
     :start-at: "skipped": {
     :end-before: "errored"
@@ -523,7 +554,7 @@ The structure of skip responses, which you should send when presented with a "kn
 The biggest consideration at the minute is how to *identify* incoming test cases.
 Adding some sort of "persistent identifier" to test cases is something we've previously discussed upstream in the official test suite, which would make this easier.
 Until that happens however, your best current bet is to match on the test case description and/or schema, and use that to decide this incoming test is unsupported (and then respond with a skip request as above).
-For a specific example of doing so for Bowtie's reporting, see `this PR <https://github.com/bowtie-json-schema/bowtie/pull/73>`_.
+For a specific example of doing so for Bowtie's reporting, see :pr:`this PR <73>`.
 
 If you've gotten to the end and wish to see the full code for the harness, have a look at the `completed harness for lua-jsonschema <https://github.com/bowtie-json-schema/bowtie/blob/090f259b03888c7bc72beb7702546d00b7622e90/implementations/lua-jsonschema/bowtie_jsonschema.lua>`_.
 
@@ -539,6 +570,8 @@ If you do so there are a few additional things to do beyond the above:
 * Commit your harness to the ``implementations`` directory in the root of Bowtie's repository, alongside the existing ones.
   Name your harness directory :file:`<{host-language}>-<{implementation-name}>/`.
   Use ASCII-compatible names, so if your implementation is written in C++ and is called ``flooblekins`` within the C++ ecosystem, call the directory ``cpp-flooblekins/``.
+* Ensure your harness is small and easily maintained, as it may need to be touched by others as Bowtie's protocol changes.
+* Install as little as possible from arbitrary URLs, preferring both the OS's package manager and your language's package manager whenever possible over manual download and compilation.
 * Please ensure you've used an ``alpine``-based image, or at least a slim one, to keep sizes as small as possible.
   Reference the existing ``Dockerfile``\ s if you need inspiration.
 * Please also add some sort of linter or autoformatter for the source code you've written.

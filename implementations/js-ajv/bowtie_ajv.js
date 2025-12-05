@@ -3,10 +3,9 @@ const readline = require("readline");
 const os = require("os");
 const process = require("process");
 
-const ajv_version = require(path.join(
-  path.dirname(path.dirname(require.resolve("ajv"))),
-  "package.json",
-)).version;
+const ajv_version = require(
+  path.join(path.dirname(path.dirname(require.resolve("ajv"))), "package.json"),
+).version;
 
 const DRAFTS = {
   "https://json-schema.org/draft/2020-12/schema": require("ajv/dist/2020"),
@@ -33,14 +32,15 @@ const cmds = {
     console.assert(args.version === 1, { args });
     started = true;
     return {
-      ready: true,
       version: 1,
       implementation: {
         language: "javascript",
         name: "ajv",
         version: ajv_version,
         homepage: "https://ajv.js.org/",
+        documentation: "https://ajv.js.org/json-schema.html",
         issues: "https://github.com/ajv-validator/ajv/issues",
+        source: "https://github.com/ajv-validator/ajv",
 
         dialects: [
           "https://json-schema.org/draft/2020-12/schema",
@@ -75,26 +75,39 @@ const cmds = {
   run: (args) => {
     console.assert(started, "Not started!");
 
-    try {
-      const testCase = args.case;
-      const registry = testCase.registry;
+    const testCase = args.case;
 
+    try {
       ajv.removeSchema(); // Clear the cache.
-      for (const id in registry) ajv.addSchema(registry[id], id);
+      for (const id in testCase.registry) {
+        ajv.addSchema(testCase.registry[id], id);
+      }
 
       const validate = ajv.compile(testCase.schema);
 
-      return {
-        seq: args.seq,
-        results: testCase.tests.map((test) => ({
-          valid: validate(test.instance),
-        })),
-      };
-    } catch (e) {
+      const results = testCase.tests.map((test) => {
+        try {
+          return { valid: validate(test.instance) };
+        } catch (error) {
+          return {
+            errored: true,
+            context: {
+              traceback: error.stack,
+              message: error.message,
+            },
+          };
+        }
+      });
+
+      return { seq: args.seq, results: results };
+    } catch (error) {
       return {
         errored: true,
         seq: args.seq,
-        context: { message: e.toString() },
+        context: {
+          traceback: error.stack,
+          message: error.message,
+        },
       };
     }
   },

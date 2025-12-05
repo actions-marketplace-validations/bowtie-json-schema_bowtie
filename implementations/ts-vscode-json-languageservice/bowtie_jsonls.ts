@@ -1,5 +1,6 @@
 import * as readline from "readline/promises";
 import * as process from "process";
+import * as os from "os";
 import * as packageJson from "./node_modules/vscode-json-languageservice/package.json";
 
 const jsonls_version = packageJson.version;
@@ -22,7 +23,6 @@ const schemaIds: { [id: string]: SchemaDraft } = {
   "http://json-schema.org/draft-07/schema#": SchemaDraft.v7,
   "http://json-schema.org/draft-06/schema#": SchemaDraft.v6,
   "http://json-schema.org/draft-04/schema#": SchemaDraft.v4,
-  "http://json-schema.org/draft-03/schema#": SchemaDraft.v3,
 };
 
 function send(data) {
@@ -38,7 +38,6 @@ const cmds = {
     console.assert(args.version === 1, { args });
     started = true;
     return {
-      ready: true,
       version: 1,
       implementation: {
         language: "typescript",
@@ -47,6 +46,7 @@ const cmds = {
         homepage: "https://github.com/microsoft/vscode-json-languageservice",
         issues:
           "https://github.com/microsoft/vscode-json-languageservice/issues",
+        source: "https://github.com/microsoft/vscode-json-languageservice",
 
         dialects: [
           "https://json-schema.org/draft/2020-12/schema",
@@ -54,8 +54,10 @@ const cmds = {
           "http://json-schema.org/draft-07/schema#",
           "http://json-schema.org/draft-06/schema#",
           "http://json-schema.org/draft-04/schema#",
-          "http://json-schema.org/draft-03/schema#",
         ],
+        os: os.platform(),
+        os_version: os.release(),
+        language_version: process.version,
       },
     };
   },
@@ -93,7 +95,13 @@ const cmds = {
           );
           return { valid: semanticErrors.length === 0 ? true : false };
         } catch (error) {
-          return { errored: true, context: { message: error.message } };
+          return {
+            errored: true,
+            context: {
+              traceback: error.stack,
+              message: error.message,
+            },
+          };
         }
       }),
     );

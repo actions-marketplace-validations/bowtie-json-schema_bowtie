@@ -1,7 +1,24 @@
-name: Bowtie Images
+name: Rebuild Bowtie Images
 
 on:
   workflow_dispatch:
+    inputs:
+      implementation:
+        description: The name of an implementation.
+        required: false
+        type: string
+      version:
+        description: >
+          A specific version of the implementation you want to build.
+
+          If the implementation has historical version support (i.e. a `matrix-versions.json` file)
+          and your specified version is included in that file then only that version of the implementation
+          will be built and if you don't specify any version over here then all of its versions from that
+          file will be built.
+
+          If no file is found then just the latest version of the implementation will be built.
+        required: false
+        type: string
   pull_request:
     paths:
       - "implementations/**"
@@ -14,6 +31,12 @@ on:
       - ".github/workflows/images.yml"
     tags:
       - "v*"
+env:
+  IMAGE_REGISTRY: ghcr.io/${{ github.repository_owner }}
+
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   list:
@@ -21,47 +44,115 @@ jobs:
     outputs:
       images: ${{ steps.images-matrix.outputs.images }}
     steps:
-      - uses: actions/checkout@v3
-      - id: images-matrix
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Calculate which images to build
+        id: images-matrix
+        env:
+          GITHUB_URL: https://github.com/${{ github.repository_owner }}
+          # The token is required because bowtie is built during the step,
+          # and we need access to packages to collect known implementations
+          BUILD_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python3 -c '
-          from pathlib import Path
-          import json
-          paths = [
-              str(path.name)
-              for path in Path("implementations").iterdir()
-              if path.is_dir()
-          ]
-          print(f"images={json.dumps(paths)}")
-          ' >> $GITHUB_OUTPUT
+          implementation=${{ inputs.implementation }}
+          version=${{ inputs.version }}
+          implementations_dir=implementations
+          matrix_versions_file="$implementations_dir/$implementation/matrix-versions.json"
+          IMPLEMENTATIONS=$(uvx --from . --python 3.13 bowtie filter-implementations --format json)
+          MATRIX="[]"
+          if [ -n "$implementation" ]; then
+            if echo "$IMPLEMENTATIONS" | jq -e --arg impl "$implementation" 'index($impl) != null' > /dev/null; then
+              if [ ! -d "$implementations_dir/$implementation" ]; then
+                echo "Implementation $implementation was moved from bowtie repository to '$GITHUB_URL/$implementation'. Please build it from its own repository"
+                exit 1
+              fi
+              if [ -f "$matrix_versions_file" ]; then
+                versions=$(cat "$matrix_versions_file" | jq -c)
+                if [ -n "$version" ]; then
+                  if echo "$versions" | jq -e --arg version "$version" 'index($version) != null' > /dev/null; then
+                    MATRIX=$(echo $MATRIX | jq --arg impl "$implementation" --arg ver "$version" '. + [{"image": $impl, "version": $ver}]')
+                  else
+                    echo "No such version ('$version') found in the \`matrix-versions.json\` file of $implementation. Please provide a correct version."
+                    exit 1
+                  fi
+                else
+                  MATRIX=$(echo $MATRIX | jq --arg impl "$implementation" --argjson vers "$versions" '. + [{"image": $impl, "version": $vers[]}]')
+                fi
+              else
+                MATRIX=$(echo $MATRIX | jq --arg impl "$implementation" '. + [{"image": $impl, "version": "latest"}]')
+              fi
+            else
+              echo "No such implementation ('$implementation') found. Please provide a correct implementation name."
+              echo "To see a list of all Bowtie supported implementations, run \`bowtie filter-implementations\`."
+              exit 1
+            fi
+          else
+            if [ -n "$version" ]; then
+              echo "Please also input an implementation name along with the version that you've provided."
+              exit 1
+            else
+              for impl in $(echo "$IMPLEMENTATIONS" | jq -r '.[]'); do
+                if [ -d "$implementations_dir/$impl" ]; then
+                  MATRIX=$(echo $MATRIX | jq --arg impl "$impl" '. + [{"image": $impl, "version": "latest"}]')
+                else
+                  echo "Implementation $implementation was moved from bowtie repository to '$GITHUB_URL/$impl'. Skip the implementation"
+                fi
+              done
+            fi
+          fi
+          echo "images=$(echo $MATRIX | jq -c .)" >> $GITHUB_OUTPUT
 
   build:
     needs: list
-    runs-on: ubuntu-latest
+
+    # Particularly for .NET (which we special case below),
+    # we need a newer buildah than what's in 22.04 (which is buildah 1.23.1)
+    # so that it properly sets TARGETARCH and therefore multi-architecture
+    # container image builds know which architecture we're building for.
+    # See https://github.com/containers/buildah/pull/4295.
+    runs-on: ubuntu-24.04
 
     permissions:
+      id-token: write
+      contents: read
+      attestations: write
       packages: write
 
     strategy:
       fail-fast: false
       matrix:
-        image: ${{ fromJson(needs.list.outputs.images) }}
+        include: ${{ fromJson(needs.list.outputs.images) }}
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v6
 
-      - uses: dorny/paths-filter@v2
+      - uses: dorny/paths-filter@v3
         id: changes
         with:
           filters: |
             impl:
-              - 'implementations/${{ matrix.image }}/**'
+            - added|modified: 'implementations/${{ matrix.image }}/**'
+        if: ${{ !inputs.implementation }}
 
       - name: Install qemu
         run: |
           sudo apt-get update
           sudo apt-get install -y qemu-user-static
-        if: steps.changes.outputs.impl == 'true' || (github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags'))
+        if: |
+          (
+            (steps.changes.outputs.impl == 'true')
+            || (github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags'))
+            || (inputs.implementation)
+          )
+          && !startsWith(matrix.image, 'dotnet-')
+          && !startsWith(matrix.image, 'go-')
+        # See https://devblogs.microsoft.com/dotnet/improving-multiplatform-container-support/ for why not .NET
+        # See https://docs.docker.com/build/building/multi-platform/#cross-compiling-a-go-application for why not Golang
 
       - name: Build
         id: build_image
@@ -71,9 +162,56 @@ jobs:
           containerfiles: |
             implementations/${{ matrix.image }}/Dockerfile
           image: ${{ matrix.image }}
-          tags: latest ${{ github.sha }}
+          tags: ${{ matrix.version }} ${{ github.sha }}
           archs: amd64, arm64
-        if: steps.changes.outputs.impl == 'true' || (github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags'))
+          build-args: |
+            ${{ inputs.implementation && format('IMPLEMENTATION_VERSION={0}', matrix.version) || '' }}
+        if: |
+          (
+            (steps.changes.outputs.impl == 'true')
+            || (github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags'))
+            || (inputs.implementation)
+          )
+
+      - name: Set DOCKER_HOST so podman-built images are findable
+        run: |
+          systemctl --user enable --now podman.socket
+          sudo loginctl enable-linger $USER
+          podman --remote info
+          echo "DOCKER_HOST=unix://$(podman info --format '{{.Host.RemoteSocket.Path}}')" >> $GITHUB_ENV
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Smoke Test
+        run: |
+          uvx --from . --python 3.13 bowtie smoke -i "localhost/${{ steps.build_image.outputs.image-with-tag }}" --format json
+          uvx --from . --python 3.13 bowtie smoke -i "localhost/${{ steps.build_image.outputs.image-with-tag }}" --format markdown >> $GITHUB_STEP_SUMMARY
+        # We special case python-fastjsonschema, which unfortunately does not
+        # pass the smoke test, as it has multiple issues handling simple
+        # schemas using the `not` keyword.
+        # See e.g. horejsek/python-fastjsonschema#181
+        continue-on-error: ${{ matrix.image == 'python-fastjsonschema' }}
+        if: |
+          (
+            (steps.changes.outputs.impl == 'true')
+            || (github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags'))
+            || (inputs.implementation)
+          )
+
+      - name: Log in to ghcr.io
+        uses: redhat-actions/podman-login@v1
+        with:
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+          registry: ${{ env.IMAGE_REGISTRY }}
+        if: |
+          (
+            (github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags'))
+            || (inputs.implementation)
+          )
 
       - name: Publish
         id: push
@@ -81,15 +219,21 @@ jobs:
         with:
           image: ${{ steps.build_image.outputs.image }}
           tags: ${{ steps.build_image.outputs.tags }}
-          registry: ghcr.io/${{ github.repository_owner }}
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-        if: github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags')
+          registry: ${{ env.IMAGE_REGISTRY }}
+        if: |
+          (
+            (github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags'))
+            || (inputs.implementation)
+          )
 
-      - name: Install Bowtie
-        uses: bowtie-json-schema/bowtie@v2023.05.12
-        if: steps.changes.outputs.impl == 'true' || (github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags'))
-
-      - name: Smoke Test
-        run: bowtie smoke -i "${{ steps.build_image.outputs.image-with-tag }}"
-        if: steps.changes.outputs.impl == 'true' || (github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags'))
+      - name: Generate attestation for images
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-name: ${{ env.IMAGE_REGISTRY }}/${{ steps.build_image.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+        if: |
+          (
+            (github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags'))
+            || (inputs.implementation)
+          )

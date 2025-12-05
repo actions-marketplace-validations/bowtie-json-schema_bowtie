@@ -27,16 +27,19 @@ class Runner:
         assert version == 1
         self._started = True
         return dict(
-            ready=True,
             version=1,
             implementation=dict(
                 language="python",
                 name="fastjsonschema",
                 version=metadata.version("fastjsonschema"),
                 homepage="https://horejsek.github.io/python-fastjsonschema/",
+                documentation=(
+                    "https://horejsek.github.io/python-fastjsonschema/"
+                ),
                 issues=(
                     "https://github.com/horejsek/python-fastjsonschema/issues"
                 ),
+                source="https://github.com/horejsek/python-fastjsonschema",
                 dialects=[
                     "http://json-schema.org/draft-07/schema#",
                     "http://json-schema.org/draft-06/schema#",

@@ -2,109 +2,219 @@ name: CI
 
 on:
   push:
+    branches-ignore:
+      - "wip*"
+    tags:
+      - "v*"
   pull_request:
-  release:
-    types: [published]
   schedule:
     # Daily at 5:12
     - cron: "12 5 * * *"
+  workflow_dispatch:
 
-env:
-  PIP_DISABLE_PIP_VERSION_CHECK: "1"
-  PIP_NO_PYTHON_VERSION_WARNING: "1"
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  pre-commit:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v4
-        with:
-          python-version: "3.x"
-      - uses: pre-commit/action@v3.0.0
-
   list:
     runs-on: ubuntu-latest
     outputs:
       noxenvs: ${{ steps.noxenvs-matrix.outputs.noxenvs }}
     steps:
-      - uses: actions/checkout@v3
-      - name: Set up nox
-        uses: wntrblm/nox@2023.04.22
+      - uses: actions/checkout@v6
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
       - id: noxenvs-matrix
         run: |
           echo >>$GITHUB_OUTPUT noxenvs=$(
-            nox --list-sessions |
-            grep '^* ' |
-            cut -d ' ' -f 2- |
-            jq --raw-input --slurp 'split("\n") | map(select(. != ""))'
+            uvx nox --list-sessions --json | jq '[.[].session]'
           )
 
   ci:
     needs: list
     runs-on: ubuntu-latest
+
     strategy:
       fail-fast: false
       matrix:
         noxenv: ${{ fromJson(needs.list.outputs.noxenvs) }}
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v6
+
       - name: Install dependencies
-        run: >
-          sudo apt-get update &&
-          sudo apt-get install -y libenchant-2-dev
+        run: sudo apt-get update && sudo apt-get install -y libenchant-2-dev
         if: runner.os == 'Linux' && startsWith(matrix.noxenv, 'docs')
       - name: Install dependencies
         run: brew install enchant podman
         if: runner.os == 'macOS'
-      - name: Set up Python
-        uses: actions/setup-python@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v6
         with:
-          python-version: "3.x"
-      - name: Set up nox
-        uses: wntrblm/nox@2023.04.22
+          node-version-file: frontend/package.json
+        if: startsWith(matrix.noxenv, 'ui')
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          package_json_file: frontend/package.json
+          run_install: false
+        if: startsWith(matrix.noxenv, 'ui')
+
+      - name: Install playwright browsers
+        run: |
+          pnpm --dir frontend install
+          pnpm --dir frontend exec playwright install --with-deps
+        if: matrix.noxenv == 'ui(tests)'
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: |
+            3.13
+            3.14
+        if: startsWith(matrix.noxenv, 'audit')
+
       - name: Run nox
-        run: nox -s "${{ matrix.noxenv }}"
+        env:
+          BUILD_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: uvx nox -s "${{ matrix.noxenv }}"
+
+      - name: Upload Playwright Report
+        uses: actions/upload-artifact@v5
+        with:
+          name: playwright-report
+          path: frontend/test-results
+          retention-days: 14
+        if: matrix.noxenv == 'ui(tests)'
+
+  containerless:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Ensure containers don't work
+        run: sudo apt-get purge docker podman
+
+      - name: Run nox
+        env:
+          BUILD_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: uvx nox -s tests-3.13 -- -m 'not containers'
+
+  coverage:
+    runs-on: ubuntu-latest
+
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Run nox
+        run: uvx nox -s tests-3.13 -- coverage github
+
+  automerge:
+    needs: ci
+    runs-on: ubuntu-latest
+
+    if: github.event_name == 'pull_request' && github.actor == 'dependabot[bot]'
+
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Automatically merge allowed PRs
+        run: gh pr merge --auto --merge "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   packaging:
     needs: ci
     runs-on: ubuntu-latest
+
+    outputs:
+      version: ${{ steps.version.outputs.tag }}
+
     environment:
       name: PyPI
       url: https://pypi.org/p/bowtie-json-schema
+
     permissions:
       contents: write
       id-token: write
+      attestations: write
 
     steps:
-      - uses: actions/checkout@v3
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - uses: actions/checkout@v6
         with:
-          python-version: "3.x"
-      - name: Install dependencies
-        run: python -m pip install build
-      - name: Create packages
-        run: python -m build .
-      - name: Set up nox
-        uses: wntrblm/nox@2023.04.22
-      - name: Create shiv
-        run: mkdir shiv/ && nox -s shiv -- shiv/bowtie && chmod +x shiv/bowtie
-      - name: Tar files
-        run: tar -cvf bowtie.tar dist shiv
-      - uses: actions/upload-artifact@v3
+          fetch-depth: 0
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
         with:
-          name: packages
-          path: bowtie.tar
+          enable-cache: true
+
+      - name: Build our distributions
+        env:
+          BUILD_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: uv run --frozen --with 'build[uv]' -m build --installer=uv
+
+        # this is temporary step to make sure we don't lose any of the implementations during migration
+        # remove once all implementations are successfully migrated to separate repos
+      - name: Collect known implementations
+        env:
+          BUILD_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXPECTED_IMPL_COUNT: 32
+        run: |
+          impl_count=$(uvx --from . --python 3.13 bowtie filter-implementations --format plain | wc -l)
+          if [ $impl_count -lt $EXPECTED_IMPL_COUNT ]; then
+            echo "bowtie collected less implementations than expected: $impl_count instead of $EXPECTED_IMPL_COUNT" >> $GITHUB_STEP_SUMMARY
+            uvx --from . --python 3.13 bowtie filter-implementations --format plain >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+      - name: Generate attestation for wheels
+        if: github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags')
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: "dist/*.whl"
+
       - name: Publish to PyPI
         if: github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags')
         uses: pypa/gh-action-pypi-publish@release/v1
       - name: Create a Release
         if: github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags')
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
-          files: |
-            shiv/bowtie
-            dist/*
           generate_release_notes: true
+      - name: Current version
+        id: version
+        if: github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags')
+        run: echo "tag=${GITHUB_REF#refs/*/}" >> $GITHUB_OUTPUT
+
+  report:
+    needs: packaging
+    uses: ./.github/workflows/report.yml
+    with:
+      bowtie-version: ${{ needs.packaging.outputs.version }}
+    if: github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags')
