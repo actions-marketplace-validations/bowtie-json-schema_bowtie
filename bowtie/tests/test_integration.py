@@ -1773,7 +1773,7 @@ class TestSmoke:
             miniatures.passes_smoke,
             json=True,
         )
-        assert jsonout, stderr  
+        assert jsonout, stderr
 
     @pytest.mark.asyncio
     async def test_json_multiple(self):

@@ -162,7 +162,7 @@ _OPTION_GROUPS = {
                 (
                     "Basic Options",
                     ["implementation", "quiet", "failures-only", "format"],
-                )
+                ),
             ],
         ),
         (
@@ -2407,7 +2407,10 @@ def trend(
 )
 @format_option()
 async def smoke(
-    start: Starter, format: _F, echo: Callable[..., None], failures_only: bool
+    start: Starter,
+    format: _F,
+    echo: Callable[..., None],
+    failures_only: bool,
 ) -> int:
     """
     Smoke test implementations for basic correctness against Bowtie's protocol.
@@ -2415,8 +2418,8 @@ async def smoke(
     results = [
         (implementation.id, implementation.info, await implementation.smoke())
         async for _, implementation in start()
-]
-   
+    ]
+
     filtered = (
         [(id, info, r) for id, info, r in results if not r.success]
         if failures_only and format != "json"
