@@ -2415,14 +2415,13 @@ async def smoke(
     results = [
         (implementation.id, implementation.info, await implementation.smoke())
         async for _, implementation in start()
-    ]
-    display_results = results
-    if (
-        failures_only and format != "json"
-    ):  # keep json unfiltered for machine use
-        display_results = [
-            (id, info, r) for id, info, r in results if not r.success
-        ]
+]
+   
+    filtered = (
+        [(id, info, r) for id, info, r in results if not r.success]
+        if failures_only and format != "json"
+        else results
+    )
 
     match results, format:
         case [(_, _, result)], "json":
@@ -2430,11 +2429,14 @@ async def smoke(
         case _, "json":
             output = {id: result.serializable() for id, _, result in results}
             echo(json.dumps(output, indent=2))
+        case [(_, _, result)], "pretty":
+            if not failures_only or not result.success:
+                STDOUT.print(result)
         case _, "pretty":
-            for _, _, each in display_results:
+            for _, _, each in filtered:
                 STDOUT.print(each)
         case _, "markdown":
-            for _, info, result in display_results:
+            for _, info, result in filtered:
                 echo(f"# {info.name} ({info.language})\n")
 
                 if result.success:
