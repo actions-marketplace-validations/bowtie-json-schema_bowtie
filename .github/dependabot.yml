@@ -148,6 +148,9 @@ updates:
   # ignore: python-jsonschema - installs the latest (unpinned) version
   # ignore: python-jsu - installs the latest (unpinned) version
   # ignore: c-jsu - installs the latest (unpinned) version
+  # ignore: java-jsu - installs the latest (unpinned) version
+  # ignore: js-jsu - installs the latest (unpinned) version
+  # ignore: perl-jsu - installs the latest (unpinned) version
 
   - package-ecosystem: "bundler"
     directory: "/implementations/ruby-json_schemer"
@@ -426,6 +429,27 @@ updates:
 
   - package-ecosystem: "docker"
     directory: "/implementations/c-jsu"
+    schedule:
+      interval: "daily"
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: "docker"
+    directory: "/implementations/java-jsu"
+    schedule:
+      interval: "daily"
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: "docker"
+    directory: "/implementations/js-jsu"
+    schedule:
+      interval: "daily"
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: "docker"
+    directory: "/implementations/perl-jsu"
     schedule:
       interval: "daily"
     cooldown:
