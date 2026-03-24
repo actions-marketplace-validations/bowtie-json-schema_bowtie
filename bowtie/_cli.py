@@ -616,6 +616,7 @@ class _Report(click.File):
             STDERR.print(error)
             ctx.exit(EX.DATAERR)
 
+
 @subcommand
 @format_option()
 @click.option(
