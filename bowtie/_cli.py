@@ -94,6 +94,27 @@ STDERR = console.Console(stderr=True)
 STARTUP_ERRORS = (CannotConnect, NoSuchImplementation, StartupFailed)
 
 
+def _progress(*columns: Any) -> Progress:
+    """
+    Create a progress bar with Bowtie's standard style.
+
+    Any additional columns are inserted between the percentage and the
+    elapsed-time indicator.
+    """
+    return Progress(
+        TextColumn("[bold blue]{task.description}"),
+        SpinnerColumn(finished_text=""),
+        BarColumn(bar_width=None),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        "•",
+        *columns,
+        "•",
+        TimeElapsedColumn(),
+        console=STDOUT,
+        transient=True,
+    )
+
+
 # rich-click's CommandGroupDict seems to be missing some covariance,
 # as using a regular dict here makes pyright complain.
 _COMMAND_GROUPS = {
@@ -1775,20 +1796,7 @@ async def info(
 
 
 async def download_versions_of(id: ConnectableId) -> frozenset[str]:
-    progress = Progress(
-        TextColumn("[bold blue]{task.description}"),
-        SpinnerColumn(finished_text=""),
-        BarColumn(bar_width=None),
-        TextColumn(
-            "[progress.percentage]{task.percentage:>3.0f}%",
-        ),
-        "•",
-        DownloadColumn(),
-        "•",
-        TimeElapsedColumn(),
-        console=STDOUT,
-        transient=True,
-    )
+    progress = _progress(DownloadColumn())
     task = progress.add_task(
         description=f"Fetching versions of {id}",
         total=None,
@@ -1837,18 +1845,7 @@ async def download_and_parse_reports_for(
 ) -> Iterable[tuple[str, Dialect, _report.Report]]:
     pretty_names_str = pretty_names_str_for(dialects)
 
-    progress = Progress(
-        TextColumn("[bold blue]{task.description}"),
-        SpinnerColumn(finished_text=""),
-        BarColumn(bar_width=None),
-        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-        "•",
-        MofNCompleteColumn(),
-        "•",
-        TimeElapsedColumn(),
-        console=STDOUT,
-        transient=True,
-    )
+    progress = _progress(MofNCompleteColumn())
 
     if versions:
         total_files = len(versions) * len(list(dialects))
@@ -2151,20 +2148,7 @@ class _VersionedReportsTar(click.File):
                     )
                     ctx.exit(EX.DATAERR)
 
-                progress = Progress(
-                    TextColumn("[bold blue]{task.description}"),
-                    SpinnerColumn(finished_text=""),
-                    BarColumn(bar_width=None),
-                    TextColumn(
-                        "[progress.percentage]{task.percentage:>3.0f}%",
-                    ),
-                    "•",
-                    MofNCompleteColumn(),
-                    "•",
-                    TimeElapsedColumn(),
-                    console=STDOUT,
-                    transient=True,
-                )
+                progress = _progress(MofNCompleteColumn())
                 dialects = (
                     cast(
                         "Iterable[Dialect] | None",
