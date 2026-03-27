@@ -2422,19 +2422,18 @@ async def smoke(
 
     filtered = (
         [(id, info, r) for id, info, r in results if not r.success]
-        if failures_only and format != "json"
+        if failures_only
         else results
     )
 
-    match results, format:
+    match filtered, format:
         case [(_, _, result)], "json":
             echo(json.dumps(result.serializable(), indent=2))
         case _, "json":
-            output = {id: result.serializable() for id, _, result in results}
+            output = {id: result.serializable() for id, _, result in filtered}
             echo(json.dumps(output, indent=2))
         case [(_, _, result)], "pretty":
-            if not failures_only or not result.success:
-                STDOUT.print(result)
+            STDOUT.print(result)
         case _, "pretty":
             for _, _, each in filtered:
                 STDOUT.print(each)

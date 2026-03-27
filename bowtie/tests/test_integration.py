@@ -1763,7 +1763,7 @@ class TestSmoke:
         assert stdout, stderr
 
     @pytest.mark.asyncio
-    async def test_failures_only_does_not_filter_json(self):
+    async def test_failures_only_filters_json(self):
         jsonout, stderr = await bowtie(
             "smoke",
             "--failures-only",
@@ -1773,7 +1773,7 @@ class TestSmoke:
             miniatures.passes_smoke,
             json=True,
         )
-        assert jsonout, stderr
+        assert jsonout == {}, stderr
 
     @pytest.mark.asyncio
     async def test_json_multiple(self):
