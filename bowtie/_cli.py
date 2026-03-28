@@ -177,7 +177,15 @@ _OPTION_GROUPS = {
             ],
         ),
         ("info", [("Basic Options", ["implementation", "format"])]),
-        ("smoke", [("Basic Options", ["implementation", "quiet", "format"])]),
+        (
+            "smoke",
+            [
+                (
+                    "Basic Options",
+                    ["implementation", "quiet", "failures-only", "format"],
+                ),
+            ],
+        ),
         (
             "filter-dialects",
             [
@@ -2392,8 +2400,18 @@ def trend(
     is_flag=True,
     help="Don't print any output, just exit with nonzero status on failure.",
 )
+@click.option(
+    "--failures-only",
+    is_flag=True,
+    help="Only show output for implementations that fail.",
+)
 @format_option()
-async def smoke(start: Starter, format: _F, echo: Callable[..., None]) -> int:
+async def smoke(
+    start: Starter,
+    format: _F,
+    echo: Callable[..., None],
+    failures_only: bool,
+) -> int:
     """
     Smoke test implementations for basic correctness against Bowtie's protocol.
     """
@@ -2402,19 +2420,25 @@ async def smoke(start: Starter, format: _F, echo: Callable[..., None]) -> int:
         async for _, implementation in start()
     ]
 
-    match results, format:
+    filtered = (
+        [(id, info, r) for id, info, r in results if not r.success]
+        if failures_only
+        else results
+    )
+
+    match filtered, format:
         case [(_, _, result)], "json":
             echo(json.dumps(result.serializable(), indent=2))
         case _, "json":
-            output = {id: result.serializable() for id, _, result in results}
+            output = {id: result.serializable() for id, _, result in filtered}
             echo(json.dumps(output, indent=2))
         case [(_, _, result)], "pretty":
             STDOUT.print(result)
         case _, "pretty":
-            for _, _, each in results:
+            for _, _, each in filtered:
                 STDOUT.print(each)
         case _, "markdown":
-            for _, info, result in results:
+            for _, info, result in filtered:
                 echo(f"# {info.name} ({info.language})\n")
 
                 if result.success:

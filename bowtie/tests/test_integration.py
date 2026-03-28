@@ -1738,6 +1738,44 @@ class TestSmoke:
         assert dedent(stdout), stdout
 
     @pytest.mark.asyncio
+    async def test_failures_only_hides_passing(self):
+        stdout, stderr = await bowtie(
+            "smoke",
+            "--failures-only",
+            "--format",
+            "pretty",
+            "-i",
+            miniatures.passes_smoke,
+        )
+        assert stdout == "", stderr
+
+    @pytest.mark.asyncio
+    async def test_failures_only_still_shows_failing(self):
+        stdout, stderr = await bowtie(
+            "smoke",
+            "--failures-only",
+            "--format",
+            "pretty",
+            "-i",
+            miniatures.always_invalid,
+            exit_code=EX.DATAERR,
+        )
+        assert stdout, stderr
+
+    @pytest.mark.asyncio
+    async def test_failures_only_filters_json(self):
+        jsonout, stderr = await bowtie(
+            "smoke",
+            "--failures-only",
+            "--format",
+            "json",
+            "-i",
+            miniatures.passes_smoke,
+            json=True,
+        )
+        assert jsonout == {}, stderr
+
+    @pytest.mark.asyncio
     async def test_json_multiple(self):
         jsonout, stderr = await bowtie(
             "smoke",
