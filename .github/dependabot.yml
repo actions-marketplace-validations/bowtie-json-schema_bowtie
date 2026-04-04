@@ -573,3 +573,17 @@ updates:
       interval: "daily"
     cooldown:
       default-days: 7
+
+  - package-ecosystem: "npm"
+    directory: "/implementations/js-ata"
+    schedule:
+      interval: "daily"
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: "docker"
+    directory: "/implementations/js-ata"
+    schedule:
+      interval: "daily"
+    cooldown:
+      default-days: 7
