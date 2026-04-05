@@ -10,7 +10,6 @@ from pathlib import Path
 from pprint import pformat
 from statistics import mean, median, quantiles
 from textwrap import dedent
-from time import perf_counter_ns
 from typing import IO, TYPE_CHECKING, Any, Literal, Protocol, cast
 import asyncio
 import json
@@ -77,7 +76,7 @@ if TYPE_CHECKING:
 
     from bowtie._commands import AnyTestResult, SeqResult
     from bowtie._connectables import Connectable, ConnectableId
-    from bowtie._core import DialectRunner, ImplementationInfo
+    from bowtie._core import ImplementationInfo
     from bowtie._registry import ValidatorRegistry
 
 
@@ -164,6 +163,7 @@ _OPTION_GROUPS = {
                 ("Required", ["implementation"]),
                 ("Schema Behavior Options", ["dialect", "set-schema"]),
                 ("Validation Metadata Options", ["description", "expect"]),
+                ("Execution Options", ["jobs"]),
             ],
         ),
         (
@@ -175,6 +175,7 @@ _OPTION_GROUPS = {
                     ["fail-fast", "filter", "max-error", "max-fail"],
                 ),
                 ("Test Modification Options", ["set-schema"]),
+                ("Execution Options", ["jobs"]),
             ],
         ),
         ("info", [("Basic Options", ["implementation", "format"])]),
@@ -217,6 +218,7 @@ _OPTION_GROUPS = {
                     "Test Run Options",
                     ["fail-fast", "filter", "max-error", "max-fail"],
                 ),
+                ("Execution Options", ["jobs"]),
             ],
         ),
         (
@@ -384,8 +386,8 @@ def implementation_subcommand(
             # FIXME: Convert this to an instance presumably, but for now we
             #        just want this data available in the functions,
             #        and introducing another type is annoying when most of the
-            #        complexity has to do with _run / _start still existing --
-            #        we need to finish removing them.
+            #        complexity has to do with _start still existing --
+            #        we need to finish removing it.
             start.connectables = connectables  # type: ignore[reportFunctionMemberAccess]
 
             fn_exit_code = await fn(start=start, **kw)  # type: ignore[reportArgumentType]
@@ -1223,6 +1225,17 @@ VALIDATE = click.option(
     ),
 )
 
+_DEFAULT_JOBS = getattr(os, "process_cpu_count", os.cpu_count)()
+JOBS = click.option(
+    "--jobs",
+    "-j",
+    "jobs",
+    type=click.IntRange(min=1),
+    default=_DEFAULT_JOBS,
+    show_default=f"{_DEFAULT_JOBS} (number of CPUs)",
+    help="Maximum number of implementations to run concurrently.",
+)
+
 _inflect_engine = InflectEngine()
 
 POSSIBLE_DIALECT_SHORTNAMES = _inflect_engine.join(sorted(Dialect.by_alias()))  # type: ignore[reportArgumentType]
@@ -1330,6 +1343,7 @@ class JSON(click.File):
 @fail_fast
 @SET_SCHEMA
 @VALIDATE
+@JOBS
 @click.argument(
     "input",
     default="-",
@@ -1339,6 +1353,7 @@ def run(
     input: Iterable[str],
     filter: CaseTransform,
     dialect: Dialect,
+    jobs: int,
     **kwargs: Any,
 ):
     """
@@ -1353,7 +1368,9 @@ def run(
         for line in input
     )
 
-    return asyncio.run(_run(**kwargs, cases=cases, dialect=dialect))
+    return asyncio.run(
+        _run_parallel(**kwargs, cases=cases, dialect=dialect, jobs=jobs),
+    )
 
 
 @subcommand
@@ -1361,6 +1378,7 @@ def run(
 @IMPLEMENTATION
 @SET_SCHEMA
 @VALIDATE
+@JOBS
 @click.option(
     "-d",
     "--description",
@@ -1386,6 +1404,7 @@ def validate(
     instances: Iterable[Any],
     expect: bool | None,
     description: str,
+    jobs: int,
     **kwargs: Any,
 ):
     """
@@ -1398,7 +1417,14 @@ def validate(
     if expect is not None:
         tests = [test.expect(expect) for test in tests]
     case = TestCase(description=description, schema=schema, tests=tests)
-    return asyncio.run(_run(fail_fast=False, **kwargs, cases=[case]))
+    return asyncio.run(
+        _run_parallel(
+            fail_fast=False,
+            **kwargs,
+            cases=[case],
+            jobs=jobs,
+        ),
+    )
 
 
 def _set_benchmarker_callable(
@@ -2565,10 +2591,12 @@ async def smoke(
 @fail_fast
 @SET_SCHEMA
 @VALIDATE
+@JOBS
 @click.argument("input", type=_suite.ClickParam(), metavar="DIALECT")
 def suite(
     input: tuple[Iterable[TestCase], Dialect, dict[str, Any]],
     filter: CaseTransform,
+    jobs: int,
     **kwargs: Any,
 ):
     """
@@ -2599,27 +2627,35 @@ def suite(
     """  # noqa: E501
     _cases, dialect, metadata = input
     cases = filter(_cases)
-    task = _run(**kwargs, dialect=dialect, cases=cases, run_metadata=metadata)
-    return asyncio.run(task)
+    return asyncio.run(
+        _run_parallel(
+            **kwargs,
+            dialect=dialect,
+            cases=cases,
+            run_metadata=metadata,
+            jobs=jobs,
+        ),
+    )
 
 
-async def _run(
-    connectables: Iterable[Connectable],
-    cases: Iterable[TestCase],
+async def _run_one(
+    connectable: Connectable,
+    cases: Sequence[TestCase],
     dialect: Dialect,
-    fail_fast: bool,
     maybe_set_schema: Callable[[Dialect], CaseTransform],
     max_fail: int | None = None,
     max_error: int | None = None,
     run_metadata: dict[str, Any] = {},
-    reporter: _report.Reporter = _report.Reporter(),
     **kwargs: Any,
-) -> int:
-    exit_code = 0
-    acknowledged: Mapping[ConnectableId, ImplementationInfo] = {}
-    runners: list[DialectRunner] = []
+) -> tuple[int, _report.Report | None]:
+    """
+    Run a single implementation through all cases, returning a Report.
+    """
+    # Log warnings to stderr but don't write report lines anywhere.
+    reporter = _report.Reporter(write=lambda **_: None)
+
     async with _start(
-        connectables=connectables,
+        connectables=[connectable],
         reporter=reporter,
         **kwargs,
     ) as starting:
@@ -2627,80 +2663,102 @@ async def _run(
             try:
                 _, implementation = await each
             except STARTUP_ERRORS as error:
-                exit_code |= EX.CONFIG
                 STDERR.print(error)
-                continue
+                return EX.CONFIG, None
 
-            try:
-                runner = await implementation.start_speaking(dialect)
-            except DialectError as error:
-                exit_code |= EX.CONFIG
-                STDERR.print(error)
-            except UnsupportedDialect as error:
-                STDERR.print(error)
-            else:
-                acknowledged[implementation.id] = implementation.info
-                runners.append(runner)
+        try:
+            runner = await implementation.start_speaking(dialect)
+        except DialectError as error:
+            STDERR.print(error)
+            return EX.CONFIG, None
+        except UnsupportedDialect as error:
+            STDERR.print(error)
+            return EX.CONFIG, None
 
-        if not runners:
-            STDERR.print(
-                "[bold red]No implementations started successfully![/]",
-            )
-            return exit_code | EX.CONFIG
-
-        reporter.ready(
-            _report.RunMetadata(
-                implementations=acknowledged,
-                dialect=dialect,
-                metadata=run_metadata,
-            ),
+        metadata = _report.RunMetadata(
+            implementations={implementation.id: implementation.info},
+            dialect=dialect,
+            metadata=run_metadata,
         )
-
+        lines: list[dict[str, Any]] = [metadata.serializable()]
         count = 0
         should_stop = False
-        unsucessful = Unsuccessful()
+        unsuccessful = Unsuccessful()
 
-        # Just to complement bowtie perf (not for other purposes)
-        time_taken_by_implementations = 0
-        time_output_file = (
-            Path(os.environ["TIME_OUTPUT_FILE"])
-            if "TIME_OUTPUT_FILE" in os.environ
-            else None
-        )
-
-        for count, case in enumerate(maybe_set_schema(dialect)(cases), 1):
+        for count, case in enumerate(
+            maybe_set_schema(dialect)(cases),
+            1,
+        ):
             seq_case = SeqCase(seq=count, case=case)
             got_result = reporter.case_started(seq_case, dialect)
-
-            responses = [seq_case.run(runner=runner) for runner in runners]
-            st_time = perf_counter_ns()
-
-            for each in asyncio.as_completed(responses):
-                result = await each
-                got_result(result=result)
-                unsucessful += result.unsuccessful()
-                time_taken_by_implementations += perf_counter_ns() - st_time
-                if (max_fail and len(unsucessful.failed) >= max_fail) or (
-                    max_error and len(unsucessful.errored) >= max_error
-                ):
-                    should_stop = True
-
-            if should_stop:
-                STDERR.print(
-                    "[bold yellow]Stopping -- the maximum number of "
-                    "unsuccessful tests was reached![/]",
-                )
+            result = await seq_case.run(runner=runner)
+            got_result(result=result)
+            lines.append(seq_case.serializable())
+            lines.append(result.serializable())
+            unsuccessful += result.unsuccessful()
+            if (max_fail and len(unsuccessful.failed) >= max_fail) or (
+                max_error and len(unsuccessful.errored) >= max_error
+            ):
+                should_stop = True
                 break
-        reporter.finished(did_fail_fast=should_stop)
-        if count == 0:
-            exit_code |= EX.NOINPUT
-            STDERR.print("[bold red]No test cases ran.[/]")
-        elif count > 1:  # XXX: Ugh, this should be removed when Reporter dies
-            STDERR.print(f"Ran [green]{count}[/] test cases.")
 
-        if time_output_file:
-            with time_output_file.open("a") as file:
-                file.write(f"{time_taken_by_implementations}\n")
+        lines.append({"did_fail_fast": should_stop})
+
+        if count == 0:
+            return EX.NOINPUT, None
+
+    return 0, _report.Report.from_input(lines)
+
+
+async def _run_parallel(
+    connectables: Iterable[Connectable],
+    cases: Iterable[TestCase],
+    dialect: Dialect,
+    jobs: int,
+    fail_fast: bool = False,
+    **kwargs: Any,
+) -> int:
+    """
+    Run each implementation individually, gated by a semaphore, then combine.
+    """
+    materialized = list(cases)
+    if not materialized:
+        STDERR.print("[bold red]No test cases ran.[/]")
+        return EX.NOINPUT
+
+    semaphore = asyncio.Semaphore(jobs)
+
+    async def run_with_limit(connectable: Connectable):
+        async with semaphore:
+            return await _run_one(
+                connectable=connectable,
+                cases=materialized,
+                dialect=dialect,
+                **kwargs,
+            )
+
+    tasks = [run_with_limit(c) for c in connectables]
+    results = await asyncio.gather(*tasks)
+
+    exit_code = 0
+    reports: list[_report.Report] = []
+    for code, report in results:
+        exit_code |= code
+        if report is not None:
+            reports.append(report)
+
+    if not reports:
+        STDERR.print(
+            "[bold red]No implementations started successfully![/]",
+        )
+        return exit_code | EX.CONFIG
+
+    combined = _report.Report.combine(*reports)
+    for line in combined.serialized():
+        click.echo(line)
+
+    if len(materialized) > 1:
+        STDERR.print(f"Ran [green]{len(materialized)}[/] test cases.")
 
     return exit_code
 
