@@ -1,4 +1,4 @@
-FROM node:22-bookworm
+FROM node:22-bookworm-slim
 RUN apt-get update && \
     apt-get install -y --no-install-recommends libre2-dev libabsl-dev libmimalloc-dev && \
     rm -rf /var/lib/apt/lists/*
