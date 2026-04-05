@@ -126,6 +126,7 @@ _COMMAND_GROUPS = {
         CommandGroupDict(
             name="Advanced Usage",
             commands=[
+                "combine",
                 "filter-dialects",
                 "filter-implementations",
                 "latest-report",
@@ -901,6 +902,66 @@ def _validation_results_table_in_markdown(
         final_content += "\n"
 
     return final_content
+
+
+@subcommand
+@click.argument(
+    "reports",
+    nargs=-1,
+    required=True,
+    type=_Report(),
+)
+def combine(reports: tuple[_report.Report, ...]):
+    """
+    Combine multiple per-implementation reports into one.
+
+    This is useful when implementations have been run individually
+    (e.g. via separate `bowtie suite -i <impl>` invocations) and the
+    results need to be assembled into a single combined report.
+
+    All input reports must have been run against the same test cases
+    and dialect.
+    """
+    try:
+        combined = _report.Report.combine(*reports)
+    except _report.InconsistentDialects as err:
+        error = DiagnosticError(
+            code="inconsistent-dialects",
+            message="Cannot combine reports with different dialects.",
+            causes=[str(err)],
+            hint_stmt=(
+                "Ensure all reports were produced for the same dialect."
+            ),
+        )
+        STDERR.print(error)
+        return EX.DATAERR
+    except _report.DuplicateImplementation as err:
+        error = DiagnosticError(
+            code="duplicate-implementation",
+            message="An implementation appears in multiple reports.",
+            causes=[str(err)],
+            hint_stmt=(
+                "Each implementation should appear in exactly one "
+                "input report."
+            ),
+        )
+        STDERR.print(error)
+        return EX.DATAERR
+    except _report.InconsistentCases as err:
+        error = DiagnosticError(
+            code="inconsistent-cases",
+            message="Reports do not contain the same test cases.",
+            causes=[str(err)],
+            hint_stmt=(
+                "Ensure all reports were produced from the same "
+                "test suite or input."
+            ),
+        )
+        STDERR.print(error)
+        return EX.DATAERR
+
+    for line in combined.serialized():
+        click.echo(line)
 
 
 @subcommand
