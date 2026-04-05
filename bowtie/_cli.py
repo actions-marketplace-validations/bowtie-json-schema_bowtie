@@ -918,8 +918,8 @@ def combine(reports: tuple[_report.Report, ...]):
     Combine multiple per-implementation reports into one.
 
     This is useful when implementations have been run individually
-    (e.g. via separate `bowtie suite -i <impl>` invocations) and the
-    results need to be assembled into a single combined report.
+    (e.g. via separate ``bowtie suite -i <implementation>`` invocations)
+    and the results need to be assembled into a single combined report.
 
     All input reports must have been run against the same test cases
     and dialect.
