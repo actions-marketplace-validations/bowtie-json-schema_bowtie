@@ -1,8 +1,7 @@
 FROM rust:1.90-slim AS builder
 
-ARG TARGETARCH
-
-RUN case "$TARGETARCH" in \
+RUN ARCH=$(dpkg --print-architecture) && \
+    case "$ARCH" in \
       amd64) \
         echo x86_64-unknown-linux-musl > /tmp/rust-target; \
         echo x86_64-linux-gnu-gcc > /tmp/linker; \
@@ -11,7 +10,7 @@ RUN case "$TARGETARCH" in \
         echo aarch64-unknown-linux-musl > /tmp/rust-target; \
         echo aarch64-linux-gnu-gcc > /tmp/linker; \
         echo gcc-aarch64-linux-gnu > /tmp/gcc-pkg ;; \
-      *) echo "Unsupported architecture: $TARGETARCH" && exit 1 ;; \
+      *) echo "Unsupported architecture: $ARCH" && exit 1 ;; \
     esac && \
     rustup target add $(cat /tmp/rust-target) && \
     apt update && apt install -y musl-tools musl-dev build-essential $(cat /tmp/gcc-pkg)
