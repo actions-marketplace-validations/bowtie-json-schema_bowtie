@@ -1,4 +1,6 @@
 import { useMemo } from "react";
+import Col from "react-bootstrap/Col";
+import Container from "react-bootstrap/Container";
 
 import { useSearchParams } from "./hooks/useSearchParams.ts";
 import { BenchmarkReportData } from "./data/parseBenchmarkData.ts";
@@ -73,8 +75,8 @@ export const BenchmarkReportView = ({
   }, [benchmarkReportData, params]);
 
   return (
-    <main className="container-lg">
-      <div className="col col-lg-8 mx-auto">
+    <Container as="main" fluid="lg">
+      <Col lg={8} className="mx-auto">
         {topPageInfoSection}
         <BenchmarkRunInfoSection
           benchmarkRunMetadata={filteredBenchmarkReportData.metadata}
@@ -89,7 +91,7 @@ export const BenchmarkReportView = ({
         <BenchmarkResultsSection
           benchmarkReportData={filteredBenchmarkReportData}
         />
-      </div>
-    </main>
+      </Col>
+    </Container>
   );
 };

@@ -16,7 +16,7 @@ const DialectCompliance = ({ implementation, dialectsCompliance }: Props) => {
     <Card className="mx-auto mb-3 col-md-9">
       <Card.Header>Compliance</Card.Header>
       <Card.Body className="overflow-x-auto">
-        <Table className="table-hover sm">
+        <Table hover size="sm">
           <thead>
             <tr>
               <th rowSpan={2} scope="col" className="text-center align-middle">

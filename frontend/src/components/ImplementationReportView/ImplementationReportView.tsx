@@ -7,6 +7,7 @@ import {
 } from "react-router";
 import Container from "react-bootstrap/Container";
 import Card from "react-bootstrap/Card";
+import Image from "react-bootstrap/Image";
 import Table from "react-bootstrap/Table";
 import Button from "react-bootstrap/Button";
 
@@ -125,7 +126,7 @@ const ReportComponent = ({ implementationReport }: Props) => {
               <tr>
                 <th>Supported Dialects</th>
                 <td className="col-7">
-                  <img
+                  <Image
                     alt={implementation.name}
                     className="my-1"
                     src={implementation.versionsBadge().href()}
