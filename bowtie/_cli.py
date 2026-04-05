@@ -10,6 +10,7 @@ from pathlib import Path
 from pprint import pformat
 from statistics import mean, median, quantiles
 from textwrap import dedent
+from time import perf_counter_ns
 from typing import IO, TYPE_CHECKING, Any, Literal, Protocol, cast
 import asyncio
 import json
@@ -2652,19 +2653,19 @@ async def _run_one(
     Run a single implementation through all cases, returning a Report.
     """
     # Log warnings to stderr but don't write report lines anywhere.
-    reporter = _report.Reporter(write=lambda **_: None)
+    reporter = SILENT
 
     async with _start(
         connectables=[connectable],
         reporter=reporter,
         **kwargs,
     ) as starting:
-        for each in starting:
-            try:
-                _, implementation = await each
-            except STARTUP_ERRORS as error:
-                STDERR.print(error)
-                return EX.CONFIG, None
+        (started,) = starting
+        try:
+            connectable_id, implementation = await started
+        except STARTUP_ERRORS as error:
+            STDERR.print(error)
+            return EX.CONFIG, None
 
         try:
             runner = await implementation.start_speaking(dialect)
@@ -2676,7 +2677,7 @@ async def _run_one(
             return EX.CONFIG, None
 
         metadata = _report.RunMetadata(
-            implementations={implementation.id: implementation.info},
+            implementations={connectable_id: implementation.info},
             dialect=dialect,
             metadata=run_metadata,
         )
@@ -2685,13 +2686,23 @@ async def _run_one(
         should_stop = False
         unsuccessful = Unsuccessful()
 
+        # Used by bowtie perf to measure implementation time.
+        time_output_file = (
+            Path(os.environ["TIME_OUTPUT_FILE"])
+            if "TIME_OUTPUT_FILE" in os.environ
+            else None
+        )
+        time_taken = 0
+
         for count, case in enumerate(
             maybe_set_schema(dialect)(cases),
             1,
         ):
             seq_case = SeqCase(seq=count, case=case)
             got_result = reporter.case_started(seq_case, dialect)
+            st_time = perf_counter_ns()
             result = await seq_case.run(runner=runner)
+            time_taken += perf_counter_ns() - st_time
             got_result(result=result)
             lines.append(seq_case.serializable())
             lines.append(result.serializable())
@@ -2703,6 +2714,10 @@ async def _run_one(
                 break
 
         lines.append({"did_fail_fast": should_stop})
+
+        if time_output_file:
+            with time_output_file.open("a") as file:
+                file.write(f"{time_taken}\n")
 
         if count == 0:
             return EX.NOINPUT, None
