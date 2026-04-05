@@ -2722,10 +2722,6 @@ async def _run_parallel(
     Run each implementation individually, gated by a semaphore, then combine.
     """
     materialized = list(cases)
-    if not materialized:
-        STDERR.print("[bold red]No test cases ran.[/]")
-        return EX.NOINPUT
-
     semaphore = asyncio.Semaphore(jobs)
 
     async def run_with_limit(connectable: Connectable):
@@ -2742,16 +2738,23 @@ async def _run_parallel(
 
     exit_code = 0
     reports: list[_report.Report] = []
+    no_cases = False
     for code, report in results:
         exit_code |= code
         if report is not None:
             reports.append(report)
+        elif code == EX.NOINPUT:
+            no_cases = True
 
     if not reports:
-        STDERR.print(
-            "[bold red]No implementations started successfully![/]",
-        )
-        return exit_code | EX.CONFIG
+        if no_cases:
+            STDERR.print("[bold red]No test cases ran.[/]")
+        else:
+            STDERR.print(
+                "[bold red]No implementations started successfully![/]",
+            )
+            exit_code |= EX.CONFIG
+        return exit_code
 
     combined = _report.Report.combine(*reports)
     for line in combined.serialized():
