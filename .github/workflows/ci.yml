@@ -75,6 +75,12 @@ jobs:
         with:
           enable-cache: true
 
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+        if: startsWith(matrix.noxenv, 'audit')
+
       - name: Run nox
         env:
           BUILD_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
