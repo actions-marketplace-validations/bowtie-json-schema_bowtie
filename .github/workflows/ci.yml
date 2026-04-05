@@ -75,14 +75,6 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: |
-            3.13
-            3.14
-        if: startsWith(matrix.noxenv, 'audit')
-
       - name: Run nox
         env:
           BUILD_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -113,7 +105,7 @@ jobs:
       - name: Run nox
         env:
           BUILD_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: uvx nox -s tests-3.13 -- -m 'not containers'
+        run: uvx nox -s tests-3.14 -- -m 'not containers'
 
   coverage:
     runs-on: ubuntu-latest
@@ -129,7 +121,7 @@ jobs:
           enable-cache: true
 
       - name: Run nox
-        run: uvx nox -s tests-3.13 -- coverage github
+        run: uvx nox -s tests-3.14 -- coverage github
 
   automerge:
     needs: ci
@@ -186,10 +178,10 @@ jobs:
           BUILD_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           EXPECTED_IMPL_COUNT: 32
         run: |
-          impl_count=$(uvx --from . --python 3.13 bowtie filter-implementations --format plain | wc -l)
+          impl_count=$(uvx --from . --python 3.14 bowtie filter-implementations --format plain | wc -l)
           if [ $impl_count -lt $EXPECTED_IMPL_COUNT ]; then
             echo "bowtie collected less implementations than expected: $impl_count instead of $EXPECTED_IMPL_COUNT" >> $GITHUB_STEP_SUMMARY
-            uvx --from . --python 3.13 bowtie filter-implementations --format plain >> $GITHUB_STEP_SUMMARY
+            uvx --from . --python 3.14 bowtie filter-implementations --format plain >> $GITHUB_STEP_SUMMARY
             exit 1
           fi
 

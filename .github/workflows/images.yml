@@ -63,7 +63,7 @@ jobs:
           version=${{ inputs.version }}
           implementations_dir=implementations
           matrix_versions_file="$implementations_dir/$implementation/matrix-versions.json"
-          IMPLEMENTATIONS=$(uvx --from . --python 3.13 bowtie filter-implementations --format json)
+          IMPLEMENTATIONS=$(uvx --from . --python 3.14 bowtie filter-implementations --format json)
           MATRIX="[]"
           if [ -n "$implementation" ]; then
             if echo "$IMPLEMENTATIONS" | jq -e --arg impl "$implementation" 'index($impl) != null' > /dev/null; then
@@ -187,8 +187,8 @@ jobs:
 
       - name: Smoke Test
         run: |
-          uvx --from . --python 3.13 bowtie smoke -i "localhost/${{ steps.build_image.outputs.image-with-tag }}" --format json
-          uvx --from . --python 3.13 bowtie smoke -i "localhost/${{ steps.build_image.outputs.image-with-tag }}" --format markdown >> $GITHUB_STEP_SUMMARY
+          uvx --from . --python 3.14 bowtie smoke -i "localhost/${{ steps.build_image.outputs.image-with-tag }}" --format json
+          uvx --from . --python 3.14 bowtie smoke -i "localhost/${{ steps.build_image.outputs.image-with-tag }}" --format markdown >> $GITHUB_STEP_SUMMARY
         # We special case python-fastjsonschema, which unfortunately does not
         # pass the smoke test, as it has multiple issues handling simple
         # schemas using the `not` keyword.

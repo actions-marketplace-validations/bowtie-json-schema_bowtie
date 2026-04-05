@@ -22,7 +22,7 @@ IMPLEMENTATIONS = ROOT / "implementations"
 UI = ROOT / "frontend"
 UI_NEEDS_INSTALL = not UI.joinpath("node_modules").is_dir()
 
-SUPPORTED = ["3.13", "3.14"]
+SUPPORTED = ["3.14"]
 LATEST = SUPPORTED[-1]
 
 nox.options.default_venv_backend = "uv"
