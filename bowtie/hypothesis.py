@@ -55,9 +55,13 @@ def pattern_from(uri):
 object_schemas = dictionaries(
     keys=text(),
     values=recursive(
-        none() | booleans() | floats() | text(printable),
-        lambda children: lists(children)
-        | dictionaries(text(printable), children),
+        none()
+        | booleans()
+        | floats(allow_nan=False, allow_infinity=False)
+        | text(printable),
+        lambda children: (
+            lists(children) | dictionaries(text(printable), children)
+        ),
         max_leaves=3,
     ),
     max_size=5,

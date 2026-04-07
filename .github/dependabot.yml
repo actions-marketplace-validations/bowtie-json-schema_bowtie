@@ -146,6 +146,11 @@ updates:
   # ignore: python-fastjsonschema - installs the latest (unpinned) version
   # ignore: python-jschon - installs the latest (unpinned) version
   # ignore: python-jsonschema - installs the latest (unpinned) version
+  # ignore: python-jsu - installs the latest (unpinned) version
+  # ignore: c-jsu - installs the latest (unpinned) version
+  # ignore: java-jsu - installs the latest (unpinned) version
+  # ignore: js-jsu - installs the latest (unpinned) version
+  # ignore: perl-jsu - installs the latest (unpinned) version
 
   - package-ecosystem: "bundler"
     directory: "/implementations/ruby-json_schemer"
@@ -214,6 +219,20 @@ updates:
     directory: "/implementations/java-jsonschemafriend"
     schedule:
       interval: "daily"
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: "gradle"
+    directory: "/implementations/java-sjf4j"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: "gradle"
+    directory: "/implementations/java-json-schema-react"
+    schedule:
+      interval: "weekly"
     cooldown:
       default-days: 7
 
@@ -402,6 +421,41 @@ updates:
       default-days: 7
 
   - package-ecosystem: "docker"
+    directory: "/implementations/python-jsu"
+    schedule:
+      interval: "daily"
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: "docker"
+    directory: "/implementations/c-jsu"
+    schedule:
+      interval: "daily"
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: "docker"
+    directory: "/implementations/java-jsu"
+    schedule:
+      interval: "daily"
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: "docker"
+    directory: "/implementations/js-jsu"
+    schedule:
+      interval: "daily"
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: "docker"
+    directory: "/implementations/perl-jsu"
+    schedule:
+      interval: "daily"
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: "docker"
     directory: "/implementations/ruby-json_schemer"
     schedule:
       interval: "daily"
@@ -458,6 +512,20 @@ updates:
       default-days: 7
 
   - package-ecosystem: "docker"
+    directory: "/implementations/java-sjf4j"
+    schedule:
+      interval: "daily"
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: "docker"
+    directory: "/implementations/java-json-schema-react"
+    schedule:
+      interval: "daily"
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: "docker"
     directory: "/implementations/scala-mjs-validator"
     schedule:
       interval: "daily"
@@ -501,6 +569,20 @@ updates:
 
   - package-ecosystem: "docker"
     directory: "/bowtie/tests/fauxmplementations/lintsonschema"
+    schedule:
+      interval: "daily"
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: "npm"
+    directory: "/implementations/js-ata"
+    schedule:
+      interval: "daily"
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: "docker"
+    directory: "/implementations/js-ata"
     schedule:
       interval: "daily"
     cooldown:

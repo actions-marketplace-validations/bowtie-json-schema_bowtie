@@ -1,5 +1,6 @@
 import { Link } from "react-router";
 import { useContext } from "react";
+import Button from "react-bootstrap/Button";
 
 import { ThemeContext } from "../context/ThemeContext";
 
@@ -16,8 +17,10 @@ const NotFound = () => {
       <p className="fs-5 text-muted mb-4 text-center">
         Sorry, the page you&apos;re looking for doesn&apos;t exist.
       </p>
-      <Link to="/" className="btn btn-primary btn-lg px-4 py-2 shadow-sm">
-        Go To Home
+      <Link to="/" className="text-decoration-none">
+        <Button size="lg" className="px-4 py-2 shadow-sm">
+          Go To Home
+        </Button>
       </Link>
     </div>
   );

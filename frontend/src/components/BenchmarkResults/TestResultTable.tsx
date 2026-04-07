@@ -3,7 +3,10 @@ import { mean, std } from "mathjs";
 import Table from "react-bootstrap/Table";
 import { useEffect, useMemo, useRef, useState, useTransition } from "react";
 import Accordion from "react-bootstrap/Accordion";
+import Col from "react-bootstrap/Col";
+import Container from "react-bootstrap/Container";
 import OverlayTrigger from "react-bootstrap/OverlayTrigger";
+import Row from "react-bootstrap/Row";
 import Tooltip from "react-bootstrap/Tooltip";
 
 const TestResultTable = ({
@@ -142,11 +145,11 @@ const TestResultTable = ({
   return (
     <Accordion.Item ref={schemaDisplayRef} eventKey={heading}>
       <Accordion.Header>
-        <div className="container-fluid">
-          <div className="row">
-            <div className="col-12 fw-bold mb-2">{heading}</div>
-          </div>
-        </div>
+        <Container fluid>
+          <Row>
+            <Col xs={12} className="fw-bold mb-2">{heading}</Col>
+          </Row>
+        </Container>
       </Accordion.Header>
       <Accordion.Body>{content}</Accordion.Body>
     </Accordion.Item>

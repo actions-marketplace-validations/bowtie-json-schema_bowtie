@@ -21,6 +21,7 @@ positionally
 providable
 quantiles
 quartiles
+runnable
 runtime
 schemas
 sensical

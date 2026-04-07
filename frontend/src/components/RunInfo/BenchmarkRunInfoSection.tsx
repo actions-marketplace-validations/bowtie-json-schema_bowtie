@@ -1,3 +1,4 @@
+import Card from "react-bootstrap/Card";
 import Table from "react-bootstrap/Table";
 
 import { BenchmarkRunMetadata } from "../../data/parseBenchmarkData";
@@ -8,10 +9,10 @@ const BenchmarkRunInfoSection = ({
   benchmarkRunMetadata: BenchmarkRunMetadata;
 }) => {
   return (
-    <div className="card mx-auto mb-3" id="run-info">
-      <div className="card-header">Benchmark Run Info</div>
+    <Card className="mx-auto mb-3" id="run-info">
+      <Card.Header>Benchmark Run Info</Card.Header>
 
-      <div className="card-body table-responsive-sm">
+      <Card.Body className="table-responsive-sm">
         <Table size="sm" hover>
           <caption className="caption-top">Run Info</caption>
           <thead>
@@ -66,8 +67,8 @@ const BenchmarkRunInfoSection = ({
             </tr>
           </thead>
         </Table>
-      </div>
-    </div>
+      </Card.Body>
+    </Card>
   );
 };
 

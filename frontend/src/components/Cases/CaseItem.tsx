@@ -7,6 +7,7 @@ import {
   RefObject,
 } from "react";
 import Accordion from "react-bootstrap/Accordion";
+import Table from "react-bootstrap/Table";
 
 import CaseResultSvg from "./CaseResultSvg";
 import SchemaDisplay from "./SchemaDisplay";
@@ -42,7 +43,7 @@ const CaseContent = ({
     <>
       <SchemaDisplay schema={caseData.schema} instance={instance} />
       <div className="overflow-x-auto">
-        <table className="table table-hover">
+        <Table hover>
           <thead>
             <tr>
               <td scope="col">
@@ -94,7 +95,7 @@ const CaseContent = ({
               </tr>
             ))}
           </tbody>
-        </table>
+        </Table>
       </div>
     </>
   );

@@ -52,6 +52,24 @@ class MissingFooter(InvalidReport):
     """
 
 
+class InconsistentDialects(InvalidReport):
+    """
+    Reports being combined use different dialects.
+    """
+
+
+class DuplicateImplementation(InvalidReport):
+    """
+    An implementation appears in more than one report being combined.
+    """
+
+
+class InconsistentCases(InvalidReport):
+    """
+    Reports being combined do not contain the same test cases.
+    """
+
+
 def writer(file: TextIO = sys.stdout) -> Callable[..., Any]:
     return lambda **result: file.write(f"{json.dumps(result)}\n")  # type: ignore[reportUnknownArgumentType]
 
@@ -329,6 +347,99 @@ class Report:  # noqa: PLW1641
             did_fail_fast=False,
         )
 
+    @classmethod
+    def combine(cls, first: Report, /, *rest: Report) -> Report:
+        """
+        Combine multiple per-implementation reports into one.
+
+        All reports must share the same dialect. Each implementation
+        must appear in exactly one of the input reports.
+        """
+        dialect = first.metadata.dialect
+
+        # The first report's seqs are canonical.
+        implementations: dict[ConnectableId, ImplementationInfo] = dict(
+            first.metadata.implementations,
+        )
+        case_to_seq: dict[str, Seq] = {
+            case.uniq(): seq for seq, case in first._cases.items()
+        }
+        results: HashTrieMap[
+            ConnectableId,
+            HashTrieMap[Seq, SeqResult],
+        ] = first._results
+        did_fail_fast = first.did_fail_fast
+        started = first.metadata.started
+
+        for report in rest:
+            if report.metadata.dialect != dialect:
+                raise InconsistentDialects(
+                    f"Expected {dialect} but got {report.metadata.dialect}",
+                )
+
+            for id, info in report.metadata.implementations.items():
+                if id in implementations:
+                    raise DuplicateImplementation(id)
+                implementations[id] = info
+
+            did_fail_fast = did_fail_fast or report.did_fail_fast
+            started = min(started, report.metadata.started)
+
+            # Map this report's seqs to the canonical ones.
+            report_uniqs = {case.uniq() for case in report._cases.values()}
+            if report_uniqs != case_to_seq.keys():
+                raise InconsistentCases(
+                    "Reports do not contain the same test cases.",
+                )
+            seq_map: dict[Seq, Seq] = {
+                seq: case_to_seq[case.uniq()]
+                for seq, case in report._cases.items()
+            }
+
+            for impl_id, impl_results in report._results.items():
+                remapped: HashTrieMap[Seq, SeqResult] = HashTrieMap()
+                for seq, result in impl_results.items():
+                    canonical_seq = seq_map[seq]
+                    if canonical_seq == result.seq:
+                        remapped = remapped.insert(canonical_seq, result)
+                    else:
+                        remapped = remapped.insert(
+                            canonical_seq,
+                            SeqResult(
+                                seq=canonical_seq,
+                                implementation=result.implementation,
+                                expected=result.expected,
+                                result=result.result,
+                            ),
+                        )
+                results = results.insert(impl_id, remapped)
+
+        return cls(
+            cases=first._cases,
+            results=results,
+            metadata=RunMetadata(
+                implementations=implementations,
+                dialect=dialect,
+                started=started,
+            ),
+            did_fail_fast=did_fail_fast,
+        )
+
+    def serialized(self) -> Iterable[str]:
+        """
+        Serialize this report for consumption by `Report.from_serialized`.
+        """
+        yield json.dumps(self.metadata.serializable())
+        for seq, case in sorted(self._cases.items()):
+            yield json.dumps(
+                SeqCase(seq=seq, case=case).serializable(),
+            )
+        for impl_id in sorted(self._results):
+            impl_results = self._results[impl_id]
+            for seq in sorted(impl_results):
+                yield json.dumps(impl_results[seq].serializable())
+        yield json.dumps({"did_fail_fast": self.did_fail_fast})
+
     @property
     def implementations(self) -> Mapping[ConnectableId, ImplementationInfo]:
         return self.metadata.implementations
@@ -380,8 +491,8 @@ class Report:  # noqa: PLW1641
             if implementation.version is not None
         ]
         unsuccessful.sort(
-            key=lambda version_compliance: (
-                sortable_version_key(version_compliance[0])
+            key=lambda version_compliance: sortable_version_key(
+                version_compliance[0],
             ),
             reverse=True,
         )

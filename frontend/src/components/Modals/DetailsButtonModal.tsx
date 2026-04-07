@@ -2,6 +2,7 @@ import Button from "react-bootstrap/Button";
 import Modal from "react-bootstrap/Modal";
 import Col from "react-bootstrap/Col";
 import Card from "react-bootstrap/Card";
+import Row from "react-bootstrap/Row";
 
 import SchemaDisplay from "../Cases/SchemaDisplay";
 import Implementation from "../../data/Implementation";
@@ -69,7 +70,7 @@ export const DetailsButtonModal = ({
         </Modal.Title>
       </Modal.Header>
       <Modal.Body>
-        <div className="row row-cols-1 row-cols-md-2 g-4">{failedResults}</div>
+        <Row xs={1} md={2} className="g-4">{failedResults}</Row>
       </Modal.Body>
       <Modal.Footer>
         <Button variant="secondary" onClick={handleClose}>

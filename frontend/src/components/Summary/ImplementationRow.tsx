@@ -1,5 +1,6 @@
 import { useContext, useState } from "react";
 import { useNavigate } from "react-router";
+import Button from "react-bootstrap/Button";
 import Col from "react-bootstrap/Col";
 import Container from "react-bootstrap/Container";
 import OverlayTrigger from "react-bootstrap/OverlayTrigger";
@@ -101,13 +102,12 @@ const ImplementationRow = ({
           implementationResults.totals.erroredTests! +
           implementationResults.totals.skippedTests! >
           0 && (
-          <button
-            type="button"
-            className="btn btn-sm btn-primary"
+          <Button
+            size="sm"
             onClick={() => setShowDetails(true)}
           >
             Details
-          </button>
+          </Button>
         )}
       </td>
       <DetailsButtonModal

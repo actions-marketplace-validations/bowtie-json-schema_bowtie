@@ -1738,6 +1738,44 @@ class TestSmoke:
         assert dedent(stdout), stdout
 
     @pytest.mark.asyncio
+    async def test_failures_only_hides_passing(self):
+        stdout, stderr = await bowtie(
+            "smoke",
+            "--failures-only",
+            "--format",
+            "pretty",
+            "-i",
+            miniatures.passes_smoke,
+        )
+        assert stdout == "", stderr
+
+    @pytest.mark.asyncio
+    async def test_failures_only_still_shows_failing(self):
+        stdout, stderr = await bowtie(
+            "smoke",
+            "--failures-only",
+            "--format",
+            "pretty",
+            "-i",
+            miniatures.always_invalid,
+            exit_code=EX.DATAERR,
+        )
+        assert stdout, stderr
+
+    @pytest.mark.asyncio
+    async def test_failures_only_filters_json(self):
+        jsonout, stderr = await bowtie(
+            "smoke",
+            "--failures-only",
+            "--format",
+            "json",
+            "-i",
+            miniatures.passes_smoke,
+            json=True,
+        )
+        assert jsonout == {}, stderr
+
+    @pytest.mark.asyncio
     async def test_json_multiple(self):
         jsonout, stderr = await bowtie(
             "smoke",
@@ -2526,6 +2564,82 @@ async def test_validate(tmp_path):
         exit_code=0,
     )
     assert stdout != ""  # the real assertion here is we succeed above
+
+
+@pytest.mark.asyncio
+async def test_combine_two_reports(tmp_path):
+    tmp_path.joinpath("schema.json").write_text("{}")
+    tmp_path.joinpath("instance.json").write_text("12")
+
+    report1_path = tmp_path / "report1.json"
+    report2_path = tmp_path / "report2.json"
+
+    stdout1, _ = await bowtie(
+        "validate",
+        "-i",
+        "direct:null",
+        tmp_path / "schema.json",
+        tmp_path / "instance.json",
+    )
+    report1_path.write_text(stdout1)
+
+    stdout2, _ = await bowtie(
+        "validate",
+        "-i",
+        miniatures.always_invalid,
+        tmp_path / "schema.json",
+        tmp_path / "instance.json",
+    )
+    report2_path.write_text(stdout2)
+
+    combined_stdout, _ = await bowtie(
+        "combine",
+        str(report1_path),
+        str(report2_path),
+    )
+
+    report = Report.from_serialized(combined_stdout.splitlines())
+    assert len(report.implementations) == 2  # noqa: PLR2004
+    assert report.total_tests == 1
+
+
+@pytest.mark.asyncio
+async def test_combine_errors_on_mismatched_dialects(tmp_path):
+    tmp_path.joinpath("schema.json").write_text("{}")
+    tmp_path.joinpath("instance.json").write_text("12")
+
+    report1_path = tmp_path / "report1.json"
+    report2_path = tmp_path / "report2.json"
+
+    stdout1, _ = await bowtie(
+        "validate",
+        "-i",
+        "direct:null",
+        "-D",
+        "2020",
+        tmp_path / "schema.json",
+        tmp_path / "instance.json",
+    )
+    report1_path.write_text(stdout1)
+
+    stdout2, _ = await bowtie(
+        "validate",
+        "-i",
+        miniatures.always_invalid,
+        "-D",
+        "7",
+        tmp_path / "schema.json",
+        tmp_path / "instance.json",
+    )
+    report2_path.write_text(stdout2)
+
+    _, stderr = await bowtie(
+        "combine",
+        str(report1_path),
+        str(report2_path),
+        exit_code=EX.DATAERR,
+    )
+    assert "dialect" in stderr.lower()
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,8 @@
 import { useEffect, useState, useTransition, useRef } from "react";
 import Accordion from "react-bootstrap/Accordion";
+import Col from "react-bootstrap/Col";
+import Container from "react-bootstrap/Container";
+import Row from "react-bootstrap/Row";
 
 import { BenchmarkGroupResult } from "../../data/parseBenchmarkData";
 import BenchmarkSummarySection from "./BenchmarkSummarySection";
@@ -27,12 +30,12 @@ const BenchmarkResult = ({
   return (
     <Accordion.Item ref={schemaDisplayRef} eventKey={benchmarkResult.name}>
       <Accordion.Header>
-        <div className="container-fluid">
-          <div className="row">
-            <div className="col-12 fw-bold mb-2">{benchmarkResult.name}</div>
-            <div className="col-12">{benchmarkResult.description}</div>
-          </div>
-        </div>
+        <Container fluid>
+          <Row>
+            <Col xs={12} className="fw-bold mb-2">{benchmarkResult.name}</Col>
+            <Col xs={12}>{benchmarkResult.description}</Col>
+          </Row>
+        </Container>
       </Accordion.Header>
       <Accordion.Body>{content}</Accordion.Body>
     </Accordion.Item>

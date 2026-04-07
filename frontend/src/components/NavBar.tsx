@@ -1,7 +1,10 @@
 import { useContext, useEffect, useState } from "react";
 import { Sun, MoonStarsFill, Book } from "react-bootstrap-icons";
 import { Link, useLocation, useMatch } from "react-router";
+import Button from "react-bootstrap/Button";
 import Container from "react-bootstrap/Container";
+import Image from "react-bootstrap/Image";
+import Nav from "react-bootstrap/Nav";
 import Navbar from "react-bootstrap/Navbar";
 import NavDropdown from "react-bootstrap/NavDropdown";
 import Collapse from "react-bootstrap/Collapse";
@@ -42,7 +45,7 @@ const NavBar = () => {
         className="d-flex justify-content-between align-items-center"
       >
         <Link className="navbar-brand me-4 py-1" to="/">
-          <img src={logo} alt="Bowtie Logo" width="128px" />
+          <Image src={logo} alt="Bowtie Logo" width="128px" />
         </Link>
         <div className="d-flex align-items-center">
           <div className="d-lg-none d-flex justify-content-between align-items-center me-2">
@@ -53,15 +56,13 @@ const NavBar = () => {
             >
               <Book size={20} />
             </Link>
-            <button
-              type="button"
-              className={`btn d-flex align-items-center justify-content-center ${
-                isDarkMode ? "btn-light" : "btn-secondary"
-              } rounded me-1 p-2`}
+            <Button
+              variant={isDarkMode ? "light" : "secondary"}
+              className="d-flex align-items-center justify-content-center rounded me-1 p-2"
               onClick={() => toggleDarkMode!()}
             >
               {isDarkMode ? <MoonStarsFill size={20} /> : <Sun size={20} />}
-            </button>
+            </Button>
           </div>
           <Navbar.Toggle
             aria-controls="collapse-navbar-nav"
@@ -72,7 +73,7 @@ const NavBar = () => {
         </div>
         <Collapse in={isNavbarOpen}>
           <div className="navbar-collapse" id="navbarSupportedContent">
-            <ul className="navbar-nav me-auto mb-2 mb-lg-0 align-items-baseline">
+            <Nav as="ul" className="me-auto mb-2 mb-lg-0 align-items-baseline">
               {isDialectPage && (
                 <>
                   <NavDropdown title="Dialects" id="dialect-dropdown">
@@ -90,20 +91,20 @@ const NavBar = () => {
                       Upload a report
                     </NavDropdown.Item>
                   </NavDropdown>
-                  <li className="nav-item">
-                    <Link className="nav-link" to="/benchmarks">
+                  <Nav.Item as="li">
+                    <Nav.Link as={Link} to="/benchmarks">
                       Benchmarks
-                    </Link>
-                  </li>
+                    </Nav.Link>
+                  </Nav.Item>
                 </>
               )}
               {isBenchmarksPage && (
                 <>
-                  <li className="nav-item">
-                    <Link className="nav-link" to="/">
+                  <Nav.Item as="li">
+                    <Nav.Link as={Link} to="/">
                       Dialect Test Reports
-                    </Link>
-                  </li>
+                    </Nav.Link>
+                  </Nav.Item>
                   <NavDropdown title="Dialects" id="dialect-dropdown">
                     {Dialect.newestToOldest().map((dialect) => (
                       <NavDropdown.Item
@@ -117,7 +118,7 @@ const NavBar = () => {
                   </NavDropdown>
                 </>
               )}
-              <li className="nav-item d-block d-lg-none">
+              <Nav.Item as="li" className="d-block d-lg-none">
                 <a
                   href="https://github.com/bowtie-json-schema/bowtie/"
                   className="link-secondary"
@@ -128,8 +129,8 @@ const NavBar = () => {
                     {version && <small>Bowtie v{version}</small>}
                   </span>
                 </a>
-              </li>
-            </ul>
+              </Nav.Item>
+            </Nav>
           </div>
         </Collapse>
         <div className="large-screen d-none d-lg-block">
@@ -142,12 +143,13 @@ const NavBar = () => {
             <Book size={20} className="me-1" />
             Docs
           </Link>
-          <button
-            className="btn border-0 me-1"
+          <Button
+            variant="link"
+            className="border-0 me-1 text-decoration-none text-reset"
             onClick={() => toggleDarkMode!()}
           >
             {isDarkMode ? <MoonStarsFill size={20} /> : <Sun size={20} />}
-          </button>
+          </Button>
           <a
             href="https://github.com/bowtie-json-schema/bowtie/"
             className="link-secondary"

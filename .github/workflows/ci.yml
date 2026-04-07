@@ -58,7 +58,7 @@ jobs:
           node-version-file: frontend/package.json
         if: startsWith(matrix.noxenv, 'ui')
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v5
         with:
           package_json_file: frontend/package.json
           run_install: false
@@ -78,9 +78,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: |
-            3.13
-            3.14
+          python-version: "3.14"
         if: startsWith(matrix.noxenv, 'audit')
 
       - name: Run nox
@@ -89,7 +87,7 @@ jobs:
         run: uvx nox -s "${{ matrix.noxenv }}"
 
       - name: Upload Playwright Report
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: playwright-report
           path: frontend/test-results
@@ -113,7 +111,7 @@ jobs:
       - name: Run nox
         env:
           BUILD_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: uvx nox -s tests-3.13 -- -m 'not containers'
+        run: uvx nox -s tests-3.14 -- -m 'not containers'
 
   coverage:
     runs-on: ubuntu-latest
@@ -129,7 +127,7 @@ jobs:
           enable-cache: true
 
       - name: Run nox
-        run: uvx nox -s tests-3.13 -- coverage github
+        run: uvx nox -s tests-3.14 -- coverage github
 
   automerge:
     needs: ci
@@ -186,16 +184,16 @@ jobs:
           BUILD_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           EXPECTED_IMPL_COUNT: 32
         run: |
-          impl_count=$(uvx --from . --python 3.13 bowtie filter-implementations --format plain | wc -l)
+          impl_count=$(uvx --from . --python 3.14 bowtie filter-implementations --format plain | wc -l)
           if [ $impl_count -lt $EXPECTED_IMPL_COUNT ]; then
             echo "bowtie collected less implementations than expected: $impl_count instead of $EXPECTED_IMPL_COUNT" >> $GITHUB_STEP_SUMMARY
-            uvx --from . --python 3.13 bowtie filter-implementations --format plain >> $GITHUB_STEP_SUMMARY
+            uvx --from . --python 3.14 bowtie filter-implementations --format plain >> $GITHUB_STEP_SUMMARY
             exit 1
           fi
 
       - name: Generate attestation for wheels
         if: github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags')
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: "dist/*.whl"
 
@@ -204,9 +202,9 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
       - name: Create a Release
         if: github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags')
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
+        run: gh release create "$GITHUB_REF_NAME" --generate-notes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Current version
         id: version
         if: github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags')

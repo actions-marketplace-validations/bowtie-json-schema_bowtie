@@ -1,4 +1,6 @@
 import { useMemo } from "react";
+import Col from "react-bootstrap/Col";
+import Container from "react-bootstrap/Container";
 
 import CasesSection from "./components/Cases/CasesSection";
 import RunInfoSection from "./components/RunInfo/RunInfoSection";
@@ -57,8 +59,8 @@ export const DialectReportView = ({
   }, [params, allImplementationsData, languages, filteredReportData]);
 
   return (
-    <main className="container-lg">
-      <div className="col col-lg-8 mx-auto">
+    <Container as="main" fluid="lg">
+      <Col lg={8} className="mx-auto">
         {topPageInfoSection}
         <RunInfoSection runMetadata={filteredReportData.runMetadata} />
         <FilterSection languages={languages} />
@@ -67,7 +69,7 @@ export const DialectReportView = ({
           otherImplementationsData={filteredOtherImplementationsData}
         />
         <CasesSection reportData={filteredReportData} />
-      </div>
-    </main>
+      </Col>
+    </Container>
   );
 };

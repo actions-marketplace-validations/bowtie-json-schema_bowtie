@@ -1,13 +1,14 @@
+import Card from "react-bootstrap/Card";
 import Table from "react-bootstrap/Table";
 
 import { RunMetadata } from "../../data/parseReportData";
 
 const RunInfoSection = ({ runMetadata }: { runMetadata: RunMetadata }) => {
   return (
-    <div className="card mx-auto mb-3" id="run-info">
-      <div className="card-header">Run Info</div>
+    <Card className="mx-auto mb-3" id="run-info">
+      <Card.Header>Run Info</Card.Header>
 
-      <div className="card-body table-responsive-sm">
+      <Card.Body className="table-responsive-sm">
         <Table size="sm" hover>
           <thead>
             <tr>
@@ -57,8 +58,8 @@ const RunInfoSection = ({ runMetadata }: { runMetadata: RunMetadata }) => {
             </Table>
           </>
         )}
-      </div>
-    </div>
+      </Card.Body>
+    </Card>
   );
 };
 

@@ -3,10 +3,28 @@ from hypothesis.strategies import sets
 import pytest
 
 from bowtie import HOMEPAGE, REPO
-from bowtie._commands import CaseResult, SeqCase, SeqResult, TestResult
+from bowtie._commands import (
+    CaseErrored,
+    CaseResult,
+    CaseSkipped,
+    SeqCase,
+    SeqResult,
+    TestResult,
+)
 from bowtie._core import Dialect, Example, ImplementationInfo, TestCase
-from bowtie._report import Report, RunMetadata
-from bowtie.hypothesis import dialects, implementations, known_dialects
+from bowtie._report import (
+    DuplicateImplementation,
+    InconsistentCases,
+    InconsistentDialects,
+    Report,
+    RunMetadata,
+)
+from bowtie.hypothesis import (
+    dialects,
+    implementations,
+    known_dialects,
+    reports,
+)
 
 # Make pytest ignore these classes matching Test*
 TestCase.__test__ = False
@@ -52,7 +70,51 @@ BAZ_V2 = ImplementationInfo(
     dialects=frozenset([DIALECT_2020, DIALECT_2019]),
 )
 FOO_RUN = RunMetadata(dialect=DIALECT_2020, implementations={"foo": FOO})
+BAR_RUN = RunMetadata(dialect=DIALECT_2020, implementations={"bar": BAR})
 NO_FAIL_FAST = dict(did_fail_fast=False)
+
+CASE1 = TestCase(
+    description="case1",
+    schema={},
+    tests=[Example(description="1", instance=1)],
+)
+CASE2 = TestCase(
+    description="case2",
+    schema={"type": "string"},
+    tests=[Example(description="2", instance="hello")],
+)
+
+
+def _report_data(
+    impl_id,
+    impl_info,
+    case_results,
+    dialect=DIALECT_2020,
+    did_fail_fast=False,
+    seq_start=1,
+):
+    """
+    Build report data for a single implementation.
+
+    ``case_results`` is a list of ``(case, result)`` pairs.
+    """
+    metadata = RunMetadata(
+        dialect=dialect,
+        implementations={impl_id: impl_info},
+    )
+    data = [metadata.serializable()]
+    for i, (case, result) in enumerate(case_results, seq_start):
+        data.append(SeqCase(seq=i, case=case).serializable())
+        data.append(
+            SeqResult(
+                seq=i,
+                implementation=impl_id,
+                expected=[t.expected() for t in case.tests],
+                result=result,
+            ).serializable(),
+        )
+    data.append({"did_fail_fast": did_fail_fast})
+    return data
 
 
 def test_eq():
@@ -491,3 +553,317 @@ def test_empty_is_empty(dialect):
 def test_empty_with_implementations_is_empty(dialect, implementations):
     report = Report.empty(dialect=dialect, implementations=implementations)
     assert report.is_empty
+
+
+class TestSerialized:
+    """Tests for Report.serialized()."""
+
+    def test_round_trip_single_case(self):
+        data = _report_data(
+            "foo",
+            FOO,
+            [(CASE1, CaseResult(results=[TestResult.VALID]))],
+        )
+        report = Report.from_input(data)
+        assert Report.from_serialized(report.serialized()) == report
+
+    def test_round_trip_multiple_cases(self):
+        data = _report_data(
+            "foo",
+            FOO,
+            [
+                (CASE1, CaseResult(results=[TestResult.VALID])),
+                (CASE2, CaseResult(results=[TestResult.INVALID])),
+            ],
+        )
+        report = Report.from_input(data)
+        assert Report.from_serialized(report.serialized()) == report
+
+    def test_round_trip_multiple_implementations(self):
+        combined = Report.combine(
+            Report.from_input(
+                _report_data(
+                    "foo",
+                    FOO,
+                    [(CASE1, CaseResult(results=[TestResult.VALID]))],
+                ),
+            ),
+            Report.from_input(
+                _report_data(
+                    "bar",
+                    BAR,
+                    [(CASE1, CaseResult(results=[TestResult.INVALID]))],
+                ),
+            ),
+        )
+        assert Report.from_serialized(combined.serialized()) == combined
+
+    def test_round_trip_errored_case(self):
+        data = _report_data(
+            "foo",
+            FOO,
+            [(CASE1, CaseErrored(context={"message": "boom"}, caught=True))],
+        )
+        report = Report.from_input(data)
+        assert Report.from_serialized(report.serialized()) == report
+
+    def test_round_trip_skipped_case(self):
+        data = _report_data(
+            "foo",
+            FOO,
+            [(CASE1, CaseSkipped(message="not supported"))],
+        )
+        report = Report.from_input(data)
+        assert Report.from_serialized(report.serialized()) == report
+
+    def test_round_trip_did_fail_fast(self):
+        data = _report_data(
+            "foo",
+            FOO,
+            [(CASE1, CaseResult(results=[TestResult.VALID]))],
+            did_fail_fast=True,
+        )
+        report = Report.from_input(data)
+        result = Report.from_serialized(report.serialized())
+        assert result == report
+        assert result.did_fail_fast
+
+    @given(report=reports())
+    @settings(suppress_health_check=[HealthCheck.too_slow])
+    def test_round_trip_any_report(self, report):
+        result = Report.from_serialized(report.serialized())
+        assert result == report
+
+
+class TestCombine:
+    """Tests for Report.combine()."""
+
+    def test_combine_two_single_implementation_reports(self):
+        foo_report = Report.from_input(
+            _report_data(
+                "foo",
+                FOO,
+                [(CASE1, CaseResult(results=[TestResult.VALID]))],
+            ),
+        )
+        bar_report = Report.from_input(
+            _report_data(
+                "bar",
+                BAR,
+                [(CASE1, CaseResult(results=[TestResult.INVALID]))],
+            ),
+        )
+        combined = Report.combine(foo_report, bar_report)
+        assert set(combined.implementations) == {"foo", "bar"}
+        assert combined.total_tests == 1
+        assert combined.unsuccessful("foo").total == 0
+        assert combined.unsuccessful("bar").total == 0  # no expected result
+
+    def test_combine_different_seqs_same_cases(self):
+        """Reports with different seq numbers but identical cases combine."""
+        foo_report = Report.from_input(
+            _report_data(
+                "foo",
+                FOO,
+                [(CASE1, CaseResult(results=[TestResult.VALID]))],
+            ),
+        )
+        bar_report = Report.from_input(
+            _report_data(
+                "bar",
+                BAR,
+                [(CASE1, CaseResult(results=[TestResult.INVALID]))],
+                seq_start=99,
+            ),
+        )
+        combined = Report.combine(foo_report, bar_report)
+        assert set(combined.implementations) == {"foo", "bar"}
+        assert combined.total_tests == 1
+
+    def test_combine_multiple_cases(self):
+        valid = CaseResult(results=[TestResult.VALID])
+        invalid = CaseResult(results=[TestResult.INVALID])
+        foo_report = Report.from_input(
+            _report_data(
+                "foo",
+                FOO,
+                [(CASE1, valid), (CASE2, valid)],
+            ),
+        )
+        bar_report = Report.from_input(
+            _report_data(
+                "bar",
+                BAR,
+                [(CASE1, invalid), (CASE2, invalid)],
+            ),
+        )
+        combined = Report.combine(foo_report, bar_report)
+        assert set(combined.implementations) == {"foo", "bar"}
+        assert combined.total_tests == len(CASE1.tests) + len(CASE2.tests)
+
+    def test_combine_fail_fast_is_ored(self):
+        foo_report = Report.from_input(
+            _report_data(
+                "foo",
+                FOO,
+                [(CASE1, CaseResult(results=[TestResult.VALID]))],
+                did_fail_fast=True,
+            ),
+        )
+        bar_report = Report.from_input(
+            _report_data(
+                "bar",
+                BAR,
+                [(CASE1, CaseResult(results=[TestResult.VALID]))],
+            ),
+        )
+        combined = Report.combine(foo_report, bar_report)
+        assert combined.did_fail_fast
+
+    def test_combine_errors_on_mismatched_dialects(self):
+        bar_2019 = ImplementationInfo(
+            name="bar",
+            language="crust",
+            homepage=HOMEPAGE,
+            issues=REPO / "issues",
+            source=REPO,
+            dialects=frozenset([DIALECT_2019]),
+        )
+        foo_report = Report.from_input(
+            _report_data(
+                "foo",
+                FOO,
+                [(CASE1, CaseResult(results=[TestResult.VALID]))],
+            ),
+        )
+        bar_report = Report.from_input(
+            _report_data(
+                "bar",
+                bar_2019,
+                [(CASE1, CaseResult(results=[TestResult.VALID]))],
+                dialect=DIALECT_2019,
+            ),
+        )
+        with pytest.raises(InconsistentDialects):
+            Report.combine(foo_report, bar_report)
+
+    def test_combine_errors_on_duplicate_implementation(self):
+        report1 = Report.from_input(
+            _report_data(
+                "foo",
+                FOO,
+                [(CASE1, CaseResult(results=[TestResult.VALID]))],
+            ),
+        )
+        report2 = Report.from_input(
+            _report_data(
+                "foo",
+                FOO,
+                [(CASE1, CaseResult(results=[TestResult.INVALID]))],
+            ),
+        )
+        with pytest.raises(DuplicateImplementation):
+            Report.combine(report1, report2)
+
+    def test_combine_three_reports(self):
+        baz = ImplementationInfo(
+            name="baz",
+            language="quux",
+            homepage=HOMEPAGE,
+            issues=REPO / "issues",
+            source=REPO,
+            dialects=frozenset([DIALECT_2020]),
+        )
+        valid = CaseResult(results=[TestResult.VALID])
+        combined = Report.combine(
+            Report.from_input(_report_data("foo", FOO, [(CASE1, valid)])),
+            Report.from_input(_report_data("bar", BAR, [(CASE1, valid)])),
+            Report.from_input(_report_data("baz", baz, [(CASE1, valid)])),
+        )
+        assert set(combined.implementations) == {"foo", "bar", "baz"}
+        assert combined.total_tests == 1
+
+    def test_combine_errors_on_different_cases(self):
+        foo_report = Report.from_input(
+            _report_data(
+                "foo",
+                FOO,
+                [(CASE1, CaseResult(results=[TestResult.VALID]))],
+            ),
+        )
+        bar_report = Report.from_input(
+            _report_data(
+                "bar",
+                BAR,
+                [(CASE2, CaseResult(results=[TestResult.VALID]))],
+            ),
+        )
+        with pytest.raises(InconsistentCases):
+            Report.combine(foo_report, bar_report)
+
+    def test_combine_errors_on_extra_cases_in_first(self):
+        valid = CaseResult(results=[TestResult.VALID])
+        foo_report = Report.from_input(
+            _report_data(
+                "foo",
+                FOO,
+                [(CASE1, valid), (CASE2, valid)],
+            ),
+        )
+        bar_report = Report.from_input(
+            _report_data(
+                "bar",
+                BAR,
+                [(CASE1, valid)],
+            ),
+        )
+        with pytest.raises(InconsistentCases):
+            Report.combine(foo_report, bar_report)
+
+    def test_combine_errors_on_extra_cases_in_rest(self):
+        valid = CaseResult(results=[TestResult.VALID])
+        foo_report = Report.from_input(
+            _report_data(
+                "foo",
+                FOO,
+                [(CASE1, valid)],
+            ),
+        )
+        bar_report = Report.from_input(
+            _report_data(
+                "bar",
+                BAR,
+                [(CASE1, valid), (CASE2, valid)],
+            ),
+        )
+        with pytest.raises(InconsistentCases):
+            Report.combine(foo_report, bar_report)
+
+    def test_combine_single_report_is_identity(self):
+        report = Report.from_input(
+            _report_data(
+                "foo",
+                FOO,
+                [(CASE1, CaseResult(results=[TestResult.VALID]))],
+            ),
+        )
+        assert Report.combine(report) == report
+
+    def test_combine_then_serialize_round_trips(self):
+        combined = Report.combine(
+            Report.from_input(
+                _report_data(
+                    "foo",
+                    FOO,
+                    [(CASE1, CaseResult(results=[TestResult.VALID]))],
+                ),
+            ),
+            Report.from_input(
+                _report_data(
+                    "bar",
+                    BAR,
+                    [(CASE1, CaseResult(results=[TestResult.INVALID]))],
+                ),
+            ),
+        )
+        assert Report.from_serialized(combined.serialized()) == combined
