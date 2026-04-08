@@ -253,6 +253,8 @@ updates:
   # ignore: scala-mjs-validator - Dependabot doesn't support Scala.
   # ignore: scala-rc-circe-json-validator - Dependabot doesn't support Scala.
 
+  # ignore: unison-typed-json - Dependabot doesn't support Unsion.
+
   # Dependabot for Dockerfiles
   # --------------------------
 
@@ -583,6 +585,13 @@ updates:
 
   - package-ecosystem: "docker"
     directory: "/implementations/js-ata"
+    schedule:
+      interval: "daily"
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: "docker"
+    directory: "/implementations/unison-typed-json"
     schedule:
       interval: "daily"
     cooldown:
