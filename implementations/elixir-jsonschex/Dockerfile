@@ -2,7 +2,7 @@ FROM elixir:1.19.5-otp-28-alpine AS builder
 WORKDIR /opt/app
 ENV MIX_ENV=prod
 RUN mix local.hex --force && mix local.rebar --force
-COPY mix.exs mix.lock ./
+COPY mix.exs mix.exs
 RUN mix deps.get --only prod && mix deps.compile
 COPY lib lib
 RUN mix compile && mix escript.build
