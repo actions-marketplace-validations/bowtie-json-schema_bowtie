@@ -243,6 +243,13 @@ updates:
     cooldown:
       default-days: 7
 
+  - package-ecosystem: "mix"
+    directory: "/implementations/elixir-jsonschex"
+    schedule:
+      interval: "daily"
+    cooldown:
+      default-days: 7
+
   - package-ecosystem: "swift"
     directory: "/implementations/swift-swift-json-schema"
     schedule:
