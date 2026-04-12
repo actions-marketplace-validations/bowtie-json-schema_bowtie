@@ -29,11 +29,13 @@ public class BowtieSjf4jValidator {
   private static final List<String> DIALECTS =
       List.of("https://json-schema.org/draft/2020-12/schema");
 
+  private static final Sjf4j JSONS = Sjf4j.global();
+
   private final PrintStream output;
   private final String startResponseJson;
   private boolean started;
   private final String dialectOkJson =
-      Sjf4j.toJsonString(new DialectResponse(true));
+      JSONS.toJsonString(new DialectResponse(true));
 
   public BowtieSjf4jValidator(PrintStream output) {
     this.output = output;
@@ -105,9 +107,9 @@ public class BowtieSjf4jValidator {
       }
 
       output.println(
-          Sjf4j.toJsonString(new RunResponse(jo.getNode("seq"), results)));
+          JSONS.toJsonString(new RunResponse(jo.getNode("seq"), results)));
     } catch (Exception e) {
-      output.println(Sjf4j.toJsonString(new RunErroredResponse(
+      output.println(JSONS.toJsonString(new RunErroredResponse(
           jo.getNode("seq"), true,
           new ErrorContext(e.getMessage(), stackTraceToString(e)))));
     }
@@ -141,7 +143,7 @@ public class BowtieSjf4jValidator {
               "https://github.com/sjf4j-projects/sjf4j",
               System.getProperty("os.name"), System.getProperty("os.version"),
               Runtime.version().toString(), List.of()));
-      return Sjf4j.toJsonString(startResponse);
+      return JSONS.toJsonString(startResponse);
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
