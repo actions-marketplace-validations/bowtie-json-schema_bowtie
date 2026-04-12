@@ -134,6 +134,13 @@ updates:
       default-days: 7
 
   - package-ecosystem: "npm"
+    directory: "/implementations/ts-json-schema-library"
+    schedule:
+      interval: "daily"
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: "npm"
     directory: "/implementations/ts-vscode-json-languageservice"
     schedule:
       interval: "daily"
@@ -583,6 +590,13 @@ updates:
 
   - package-ecosystem: "docker"
     directory: "/implementations/js-ata"
+    schedule:
+      interval: "daily"
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: "docker"
+    directory: "/implementations/ts-json-schema-library"
     schedule:
       interval: "daily"
     cooldown:
