@@ -90,8 +90,9 @@ defmodule BowtieJSONSchex do
   defp handle_command(%{"cmd" => "stop"}, _state) do
     System.halt(0)
   end
+
   defp handle_command(%{"cmd" => "dialect", "dialect" => dialect}, state) do
-    {:reply, %{ok: dialect in @dialects}, Map.put(state, :default_dialect, dialect)}
+    {:reply, %{ok: true}, Map.put(state, :default_dialect, dialect)}
   end
 
   defp handle_command(%{"cmd" => "run", "seq" => tseq, "case" => tcase}, state) do
