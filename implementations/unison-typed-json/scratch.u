@@ -96,7 +96,7 @@ bowtie.responseStart =
       , object
           [ ("language", text "unison")
           , ("name", text "typed-json")
-          , ("version", text "0.9.0")
+          , ("version", text VERSION)
           , ( "homepage"
             , text "https://share.unison-lang.org/@frawa/typed-json"
             )
