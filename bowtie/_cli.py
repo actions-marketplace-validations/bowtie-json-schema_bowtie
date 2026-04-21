@@ -2755,10 +2755,11 @@ async def _run_parallel(
     reports: list[_report.Report] = []
     no_cases = False
     for code, report in results:
-        exit_code |= code
         if report is not None:
+            exit_code |= code
             reports.append(report)
         elif code == EX.NOINPUT:
+            exit_code |= code
             no_cases = True
 
     if not reports:
