@@ -50,7 +50,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
-          printf 'implementations=%s\n' "$(bowtie filter-implementations --format json)" >> $GITHUB_OUTPUT
+          printf 'implementations=%s\n' "$(bowtie filter-implementations --format json | jq -c '.')" >> $GITHUB_OUTPUT
 
       - name: Collect supported dialects
         id: dialects-matrix
