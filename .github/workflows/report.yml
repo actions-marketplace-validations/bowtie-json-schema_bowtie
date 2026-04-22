@@ -25,7 +25,7 @@ permissions:
   id-token: write # zizmor: ignore[excessive-permissions]
 
 concurrency:
-  group: "pages"
+  group: "report"
   cancel-in-progress: true
 
 jobs:
@@ -105,6 +105,7 @@ jobs:
 
   combine-reports:
     name: Combine Reports
+    if: ${{ !cancelled() }}
     needs:
       - matrix
       - regenerate-reports
@@ -228,6 +229,7 @@ jobs:
 
   site:
     name: Assemble Site
+    if: ${{ !cancelled() }}
     needs:
       - combine-reports
       - generate-implementation-metadata
@@ -303,6 +305,7 @@ jobs:
           path: site
 
   redeploy-frontend:
+    if: ${{ !cancelled() && needs.site.result == 'success' }}
     permissions:
       contents: read # for actions/checkout in ui.yml
       pages: write # to deploy to GitHub Pages
