@@ -304,6 +304,7 @@ jobs:
 
   redeploy-frontend:
     permissions:
+      contents: read # for actions/checkout in ui.yml
       pages: write # to deploy to GitHub Pages
       id-token: write # to verify the deployment originates from this workflow
     needs: site
