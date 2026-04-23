@@ -610,6 +610,20 @@ async def test_unsupported_known_dialect():
 
 
 @pytest.mark.asyncio
+async def test_direct_connector_exception_does_not_crash():
+    async with run("-i", miniatures.crashes_on_validate) as send:
+        results, stderr = await send(
+            """
+            {"description": "1", "schema": {}, "tests": [{"description": "foo", "instance": {}}] }
+            """,  # noqa: E501
+        )
+
+    assert results == [
+        {miniatures.crashes_on_validate: ErroredTest.in_errored_case()},
+    ], stderr
+
+
+@pytest.mark.asyncio
 @pytest.mark.containers
 async def test_restarts_crashed_implementations(envsonschema):
     async with run("-i", envsonschema) as send:
