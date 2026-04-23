@@ -15,7 +15,13 @@ from referencing.jsonschema import EMPTY_REGISTRY
 from url import URL
 
 from bowtie import DOCS, HOMEPAGE, REPO
-from bowtie._commands import CaseErrored, CaseResult, Started, StartedDialect, TestResult
+from bowtie._commands import (
+    CaseErrored,
+    CaseResult,
+    Started,
+    StartedDialect,
+    TestResult,
+)
 from bowtie._core import Dialect, ImplementationInfo, registry
 from bowtie._registry import Invalid, SchemaCompiler, ValidatorRegistry
 from bowtie.exceptions import CannotConnect
@@ -84,7 +90,7 @@ class Unconnection[E: Exception]:
                         TestResult(valid=validate(test["instance"]) is None)
                         for test in case["tests"]
                     ]
-                except Exception as err:
+                except Exception as err:  # noqa: BLE001
                     return {
                         "seq": seq,
                         **CaseErrored.uncaught(
