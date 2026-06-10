@@ -1,4 +1,4 @@
-FROM alpine:3.22
+FROM alpine:3.24
 WORKDIR /usr/src/myapp
 
 RUN apk add --no-cache \
