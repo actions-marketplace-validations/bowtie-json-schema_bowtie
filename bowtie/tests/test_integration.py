@@ -1,22 +1,28 @@
 from collections.abc import Iterable
-from contextlib import asynccontextmanager, suppress
+from contextlib import (
+    asynccontextmanager,
+    contextmanager,
+    nullcontext,
+    suppress,
+)
 from datetime import datetime, timedelta
 from io import BytesIO
 from pathlib import Path
-from pprint import pformat
+from tempfile import TemporaryDirectory
 from textwrap import dedent
 import asyncio
 import json as _json
 import os
 import platform
 import re
+import subprocess
 import sys
 import tarfile
 
-from aiodocker.exceptions import DockerError
 from dateutil.parser import isoparse, parse as parse_datetime
 from dateutil.tz import tzlocal
 from dateutil.utils import default_tzinfo, within_delta
+from imaged import EngineError, EngineFailed
 from markdown_it import MarkdownIt
 from markdown_it.tree import SyntaxTreeNode
 import pexpect
@@ -25,6 +31,7 @@ import pytest_asyncio
 
 from bowtie._cli import EX
 from bowtie._commands import ErroredTest, TestResult
+from bowtie._connectables import Connectable
 from bowtie._core import (
     Dialect,
     Implementation,
@@ -45,7 +52,19 @@ HERE = Path(__file__).parent
 FAUXMPLEMENTATIONS = HERE / "fauxmplementations"
 
 # Make believe we're wide for tests to avoid line breaks in rich-click.
-WIDE_TERMINAL_ENV = dict(os.environ, TERMINAL_WIDTH="512")
+#
+# PYTHONUTF8 ensures subprocesses use UTF-8 I/O (no-op on Linux).
+#
+# On Windows, Rich subtracts 1 from the console width when piped stdout has
+# no VT capability.  COLUMNS=81 compensates so both platforms produce
+# identical 80-column output.
+_COLUMNS = "81" if sys.platform == "win32" else "80"
+WIDE_TERMINAL_ENV = dict(
+    os.environ,
+    TERMINAL_WIDTH="512",
+    PYTHONUTF8="1",
+    COLUMNS=_COLUMNS,
+)
 WIDE_TERMINAL_ENV.pop("CI", None)  # Run subprocesses as if they're not in CI
 
 
@@ -57,8 +76,49 @@ class _Miniatures:
 
 miniatures = _Miniatures()
 
+
+class _ReportId:
+    """
+    The report id a miniature shows up as in a report.
+
+    A report identifies an implementation by *which* it is, not by how it was
+    reached, so ``report_id.always_invalid`` is ``miniatures.always_invalid``
+    with its connector dropped.
+    """
+
+    def __getattr__(self, name: str) -> str:
+        return Connectable.from_str(getattr(miniatures, name)).report_id
+
+
+report_id = _ReportId()
+
 #: An arbitrary harness for when behavior shouldn't depend on a specific one.
 ARBITRARY = miniatures.always_invalid
+
+#: A header line for hand-writing reports within tests.
+FAUX_REPORT_HEADER = _json.dumps(
+    {
+        "implementations": {
+            "direct:miniatures:always_invalid": {
+                "name": "always_invalid",
+                "language": "python",
+                "homepage": "https://example.com",
+                "issues": "https://example.com",
+                "source": "https://example.com",
+                "dialects": ["http://json-schema.org/draft-07/schema#"],
+                "version": "1.0",
+                "language_version": "3",
+                "os": "Linux",
+                "os_version": "1",
+                "documentation": "https://example.com",
+            },
+        },
+        "bowtie_version": "0.1",
+        "metadata": {},
+        "dialect": "http://json-schema.org/draft-07/schema#",
+        "started": "2026-06-02T12:00:00Z",
+    },
+)
 
 VALIDATORS = Direct.from_id("python-jsonschema").registry()
 
@@ -90,7 +150,13 @@ async def bowtie(*argv, stdin: str = "", exit_code=EX.OK, json=False):
         env=WIDE_TERMINAL_ENV,
     )
     raw_stdout, raw_stderr = await process.communicate(stdin.encode())
-    decoded = stdout, stderr = raw_stdout.decode(), raw_stderr.decode()
+    # Decode explicitly as UTF-8 (PYTHONUTF8=1 is set in the env) and
+    # normalize Windows CRLF line endings to LF so that test assertions
+    # don't need platform-specific expected strings.
+    decoded = stdout, stderr = (
+        raw_stdout.decode("utf-8").replace("\r\n", "\n"),
+        raw_stderr.decode("utf-8").replace("\r\n", "\n"),
+    )
 
     if exit_code == -1:
         assert process.returncode != 0, decoded
@@ -109,15 +175,6 @@ async def bowtie(*argv, stdin: str = "", exit_code=EX.OK, json=False):
         return jsonout, stderr
 
     return decoded
-
-
-def tar_from_directory(directory):
-    fileobj = BytesIO()
-    with tarfile.TarFile(fileobj=fileobj, mode="w") as tar:
-        for file in directory.iterdir():
-            tar.add(file, file.name)
-    fileobj.seek(0)
-    return fileobj
 
 
 def tar_from_versioned_reports(
@@ -155,18 +212,24 @@ def tar_from_versioned_reports(
             tar.addfile(report_info, BytesIO(report_bytes))
 
 
-def image(name, fileobj):
+def image(name, context):
+    """
+    A fixture building an image.
+
+    `context` is called to get a context manager yielding the directory
+    to build from.
+    """
+
     @pytest_asyncio.fixture(scope="module")
-    async def _image(docker):
-        images = docker.images
+    async def _image(engine):
         t = tag(name)
-        lines = await images.build(fileobj=fileobj, encoding="utf-8", tag=t)
-        try:
-            await docker.images.inspect(t)
-        except DockerError:
-            pytest.fail(f"Failed to build {name}:\n\n{pformat(lines)}")
+        with context() as directory:
+            try:
+                await engine.build(tag=t, context=directory)
+            except EngineFailed as err:
+                pytest.fail(f"Failed to build {name}:\n\n{err}")
         yield t
-        await images.delete(name=t, force=True)
+        await engine.remove_image(t)
 
     return _image
 
@@ -175,30 +238,29 @@ def fauxmplementation(name):
     """
     A fake implementation built from files in the fauxmplementations directory.
     """
-    fileobj = tar_from_directory(FAUXMPLEMENTATIONS / name)
-    return image(name=name, fileobj=fileobj)
+
+    def context():
+        return nullcontext(FAUXMPLEMENTATIONS / name)
+
+    return image(name=name, context=context)
 
 
 def strimplementation(name, contents, files={}, base="alpine:3.22"):
     """
     A fake implementation built from the given Dockerfile contents.
     """
-    containerfile = f"FROM {base}\n{dedent(contents)}".encode()
 
-    fileobj = BytesIO()
-    with tarfile.TarFile(fileobj=fileobj, mode="w") as tar:
-        info = tarfile.TarInfo(name="Dockerfile")
-        info.size = len(containerfile)
-        tar.addfile(info, BytesIO(containerfile))
+    @contextmanager
+    def context():
+        with TemporaryDirectory() as directory:
+            directory = Path(directory)
+            containerfile = f"FROM {base}\n{dedent(contents)}"
+            directory.joinpath("Dockerfile").write_text(containerfile)
+            for each, text in files.items():
+                directory.joinpath(each).write_text(dedent(text))
+            yield directory
 
-        for k, v in files.items():
-            v = dedent(v).encode("utf-8")
-            info = tarfile.TarInfo(name=k)
-            info.size = len(v)
-            tar.addfile(info, BytesIO(v))
-
-    fileobj.seek(0)
-    return image(name=name, fileobj=fileobj)
+    return image(name=name, context=context)
 
 
 def shellplementation(name, contents):
@@ -331,35 +393,25 @@ wrong_number_of_tests = shellplementation(
 
 
 @pytest_asyncio.fixture
-async def envsonschema_container(docker, envsonschema):
-    config = dict(
-        Image=envsonschema,
-        OpenStdin=True,
-        HostConfig=dict(NetworkMode="none"),
-    )
-    container = await docker.containers.create(config=config)
-    await container.start()
-    yield f"container:{container.id}"
+async def envsonschema_container(engine, envsonschema):
+    id = await engine.create(envsonschema, network=False)
+    await engine.start_detached(id)
+    yield f"container:{id}"
 
     # FIXME: When this happens, it's likely due to #1187.
-    with suppress(DockerError):
-        await container.delete()
+    with suppress(EngineError):
+        await engine.remove(id)
 
 
 @pytest_asyncio.fixture
-async def lintsonschema_container(docker, lintsonschema):
-    config = dict(
-        Image=lintsonschema,
-        OpenStdin=True,
-        HostConfig=dict(NetworkMode="none"),
-    )
-    container = await docker.containers.create(config=config)
-    await container.start()
-    yield f"container:{container.id}"
+async def lintsonschema_container(engine, lintsonschema):
+    id = await engine.create(lintsonschema, network=False)
+    await engine.start_detached(id)
+    yield f"container:{id}"
 
     # FIXME: When this happens, it's likely due to #1187.
-    with suppress(DockerError):
-        await container.delete()
+    with suppress(EngineError):
+        await engine.remove(id)
 
 
 @asynccontextmanager
@@ -416,7 +468,7 @@ class TestRun:
             results, stderr = await send()
 
         assert results == [
-            {miniatures.always_invalid: TestResult.INVALID},
+            {report_id.always_invalid: TestResult.INVALID},
         ], stderr
 
     @pytest.mark.asyncio
@@ -447,8 +499,8 @@ class TestRun:
             [
                 {"type": "integer"},
                 [
-                    [12, {"direct:null": "valid"}],
-                    [12.5, {"direct:null": "valid"}],
+                    [12, {"null": "valid"}],
+                    [12.5, {"null": "valid"}],
                 ],
             ],
         ], run_stderr
@@ -515,19 +567,405 @@ async def test_suite(tmp_path):
                     (
                         one,
                         {
-                            miniatures.always_invalid: TestResult.INVALID,
+                            report_id.always_invalid: TestResult.INVALID,
                         },
                     ),
                     (
                         two,
                         {
-                            miniatures.always_invalid: TestResult.INVALID,
+                            report_id.always_invalid: TestResult.INVALID,
                         },
                     ),
                 ],
             ),
         ],
     )
+
+
+@pytest.mark.asyncio
+async def test_site_collect(tmp_path):
+    suite = tmp_path / "suite"
+    cases = _json.dumps(
+        [
+            {
+                "description": "integer",
+                "schema": {"type": "integer"},
+                "tests": [
+                    {"description": "an integer", "data": 1, "valid": True},
+                    {"description": "a string", "data": "foo", "valid": False},
+                ],
+            },
+        ],
+    )
+    # The implementation supports only draft7, so even though the suite
+    # provides two dialects, only draft7 should be collected.
+    for each in ("draft7", "draft2020-12"):
+        dialect_dir = suite / "tests" / each
+        dialect_dir.mkdir(parents=True)
+        dialect_dir.joinpath("type.json").write_text(cases)
+
+    out = tmp_path / "reports"
+    await bowtie(
+        "site",
+        "collect",
+        "-i",
+        miniatures.only_supports + ",dialect=draft7",
+        "--suite",
+        suite,
+        "--output",
+        out,
+    )
+
+    assert {path.relative_to(out) for path in out.rglob("*")} == {
+        Path("draft7.json"),
+    }
+    report = Report.from_serialized(
+        out.joinpath("draft7.json").read_text().splitlines(),
+    )
+    assert report.metadata.dialect == Dialect.by_short_name()["draft7"]
+    assert not report.is_empty
+
+
+@pytest.mark.asyncio
+async def test_site_collect_withholds_all_errored_reports(tmp_path):
+    """
+    A report in which every test errored indicates a broken implementation
+    or harness, and publishing it would silently wipe out good results.
+    """
+    suite = tmp_path / "suite"
+    dialect_dir = suite / "tests" / "draft7"
+    dialect_dir.mkdir(parents=True)
+    dialect_dir.joinpath("type.json").write_text(
+        _json.dumps(
+            [
+                {
+                    "description": "integer",
+                    "schema": {"type": "integer"},
+                    "tests": [
+                        {
+                            "description": "an integer",
+                            "data": 1,
+                            "valid": True,
+                        },
+                    ],
+                },
+            ],
+        ),
+    )
+
+    out = tmp_path / "reports"
+    _stdout, stderr = await bowtie(
+        "site",
+        "collect",
+        "-i",
+        miniatures.crashes_on_validate,
+        "--suite",
+        suite,
+        "--output",
+        out,
+        exit_code=EX.DATAERR,
+    )
+    assert "errored" in stderr
+    assert not list(out.rglob("*.json"))
+
+
+@pytest.mark.asyncio
+async def test_site_collect_refuses_existing_output(tmp_path):
+    suite = tmp_path / "suite"
+    dialect_dir = suite / "tests" / "draft7"
+    dialect_dir.mkdir(parents=True)
+    dialect_dir.joinpath("type.json").write_text(
+        _json.dumps(
+            [
+                {
+                    "description": "integer",
+                    "schema": {"type": "integer"},
+                    "tests": [
+                        {"description": "ok", "data": 1, "valid": True},
+                    ],
+                },
+            ],
+        ),
+    )
+    out = tmp_path / "reports"
+    out.mkdir()
+
+    await bowtie(
+        "site",
+        "collect",
+        "-i",
+        miniatures.only_supports + ",dialect=draft7",
+        "--suite",
+        suite,
+        "--output",
+        out,
+        exit_code=EX.CONFIG,
+    )
+
+
+@pytest.mark.asyncio
+async def test_site_collect_one_report_per_supported_dialect(tmp_path):
+    suite = tmp_path / "suite"
+    cases = _json.dumps(
+        [
+            {
+                "description": "integer",
+                "schema": {"type": "integer"},
+                "tests": [
+                    {"description": "an integer", "data": 1, "valid": True},
+                ],
+            },
+        ],
+    )
+    for each in ("draft7", "draft2020-12"):
+        dialect_dir = suite / "tests" / each
+        dialect_dir.mkdir(parents=True)
+        dialect_dir.joinpath("type.json").write_text(cases)
+
+    out = tmp_path / "reports"
+    # always_invalid supports every dialect, so the report set is exactly the
+    # dialects the suite provides -- exercising repeated start_speaking on one
+    # started implementation.
+    await bowtie(
+        "site",
+        "collect",
+        "-i",
+        miniatures.always_invalid,
+        "--suite",
+        suite,
+        "--output",
+        out,
+    )
+
+    assert {path.relative_to(out) for path in out.rglob("*")} == {
+        Path("draft7.json"),
+        Path("draft2020-12.json"),
+    }
+
+
+@pytest.mark.asyncio
+async def test_site_collect_requires_a_single_implementation(tmp_path):
+    await bowtie(
+        "site",
+        "collect",
+        "-i",
+        "direct:null",
+        "-i",
+        miniatures.always_invalid,
+        "--output",
+        tmp_path / "reports",
+        exit_code=EX.USAGE,
+    )
+
+
+@pytest.mark.asyncio
+async def test_site_combine(tmp_path):
+    suite = tmp_path / "suite"
+    dialect_dir = suite / "tests" / "draft7"
+    dialect_dir.mkdir(parents=True)
+    dialect_dir.joinpath("type.json").write_text(
+        _json.dumps(
+            [
+                {
+                    "description": "integer",
+                    "schema": {"type": "integer"},
+                    "tests": [
+                        {
+                            "description": "an integer",
+                            "data": 1,
+                            "valid": True,
+                        },
+                    ],
+                },
+            ],
+        ),
+    )
+
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    await bowtie(
+        "site",
+        "collect",
+        "-i",
+        "direct:null",
+        "--suite",
+        suite,
+        "--output",
+        a,
+    )
+    await bowtie(
+        "site",
+        "collect",
+        "-i",
+        "direct:python-jsonschema",
+        "--suite",
+        suite,
+        "--output",
+        b,
+    )
+
+    site = tmp_path / "site"
+    await bowtie("site", "combine", str(a), str(b), "--output", site)
+
+    # Badges are written under each implementation's report id, and also under
+    # its (differing) self-reported id so existing badge URLs keep resolving.
+    # null's ids differ (null vs python-null), so it gets both; for
+    # python-jsonschema they coincide, so it gets a single directory.
+    assert {path.relative_to(site) for path in site.rglob("*")} == {
+        Path("draft7.json"),
+        Path("implementations.json"),
+        Path("api"),
+        Path("api/v1"),
+        Path("api/v1/json-schema-org"),
+        Path("api/v1/json-schema-org/implementations"),
+        Path("badges"),
+        Path("badges/null"),
+        Path("badges/null/compliance"),
+        Path("badges/null/compliance/draft7.json"),
+        Path("badges/null/supported_versions.json"),
+        Path("badges/python-null"),
+        Path("badges/python-null/compliance"),
+        Path("badges/python-null/compliance/draft7.json"),
+        Path("badges/python-null/supported_versions.json"),
+        Path("badges/python-jsonschema"),
+        Path("badges/python-jsonschema/compliance"),
+        Path("badges/python-jsonschema/compliance/draft7.json"),
+        Path("badges/python-jsonschema/supported_versions.json"),
+    }
+
+    # The combined per-dialect report contains both implementations.
+    report = Report.from_serialized(
+        site.joinpath("draft7.json").read_text().splitlines(),
+    )
+    assert len(report.implementations) == 2  # noqa: PLR2004
+
+    # implementations.json lists both, gathered from the reports' metadata.
+    impls = _json.loads(site.joinpath("implementations.json").read_text())
+    assert len(impls) == 2  # noqa: PLR2004
+
+    # The public API data is produced and valid against its bundled schema.
+    import jsonschema
+
+    api = _json.loads(
+        site.joinpath("api/v1/json-schema-org/implementations").read_text(),
+    )
+    schema = _json.loads(
+        Path(__file__)
+        .parents[1]
+        .joinpath("schemas/api/v1/json-schema-org/implementations.json")
+        .read_text(),
+    )
+    jsonschema.validate(instance=api, schema=schema)
+    assert len(api) == 2  # noqa: PLR2004
+    entry = next(iter(api.values()))
+    assert entry["badges_urls"]["supported_versions"].startswith(
+        "https://bowtie.report/badges/",
+    )
+
+
+def _has_bugs_connectable(version):
+    return (
+        f"direct:{_miniatures.__name__}:has_bugs_by_versions,version={version}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_site_collect_versioned(tmp_path):
+    """
+    `site collect --versioned` writes one report tree per version, keyed by the
+    version each implementation reports, plus a matrix-versions.json index.
+    """
+    suite = tmp_path / "suite"
+    cases = _json.dumps(
+        [
+            {
+                "description": "integer",
+                "schema": {"type": "integer"},
+                "tests": [
+                    {"description": "an integer", "data": 1, "valid": True},
+                    {"description": "a string", "data": "foo", "valid": False},
+                ],
+            },
+        ],
+    )
+    for each in ("draft7", "draft2020-12"):
+        dialect_dir = suite / "tests" / each
+        dialect_dir.mkdir(parents=True)
+        dialect_dir.joinpath("type.json").write_text(cases)
+
+    out = tmp_path / "buggy"
+    await bowtie(
+        "site",
+        "collect",
+        "--versioned",
+        "-i",
+        _has_bugs_connectable("1.0"),
+        "-i",
+        _has_bugs_connectable("2.0"),
+        # A repeated version (e.g. the current image also matching a tag) is
+        # collected only once.
+        "-i",
+        _has_bugs_connectable("1.0"),
+        "--suite",
+        suite,
+        "--output",
+        out,
+    )
+
+    assert sorted(_json.loads((out / "matrix-versions.json").read_text())) == [
+        "1.0",
+        "2.0",
+    ]
+    for version in ("1.0", "2.0"):
+        report = Report.from_serialized(
+            out.joinpath(f"v{version}", "draft7.json")
+            .read_text()
+            .splitlines(),
+        )
+        assert report.metadata.dialect == Dialect.by_short_name()["draft7"]
+        assert not report.is_empty
+
+
+@pytest.mark.asyncio
+@pytest.mark.containers
+async def test_site_collect_versioned_skips_unavailable(tmp_path):
+    """
+    A version whose image can't start is skipped, leaving the others (and the
+    matrix-versions.json index) intact rather than aborting the whole trend.
+    """
+    suite = tmp_path / "suite"
+    dialect_dir = suite / "tests" / "draft7"
+    dialect_dir.mkdir(parents=True)
+    dialect_dir.joinpath("type.json").write_text(
+        _json.dumps(
+            [
+                {
+                    "description": "integer",
+                    "schema": {"type": "integer"},
+                    "tests": [{"description": "ok", "data": 1, "valid": True}],
+                },
+            ],
+        ),
+    )
+
+    out = tmp_path / "buggy"
+    await bowtie(
+        "site",
+        "collect",
+        "--versioned",
+        "-i",
+        _has_bugs_connectable("1.0"),
+        # No such image exists, so starting it fails and it is skipped.
+        "-i",
+        "image:bowtie-json-schema/does-not-exist:9.9.9",
+        "--suite",
+        suite,
+        "--output",
+        out,
+    )
+
+    assert _json.loads((out / "matrix-versions.json").read_text()) == ["1.0"]
+    assert out.joinpath("v1.0", "draft7.json").exists()
 
 
 @pytest.mark.asyncio
@@ -540,7 +978,7 @@ async def test_set_schema_sets_a_dialect_explicitly():
         )
 
     # XXX: we need to make run() return the whole report
-    assert results == [{"direct:null": TestResult.VALID}], stderr
+    assert results == [{"null": TestResult.VALID}], stderr
 
 
 @pytest.mark.asyncio
@@ -619,7 +1057,7 @@ async def test_direct_connector_exception_does_not_crash():
         )
 
     assert results == [
-        {miniatures.crashes_on_validate: ErroredTest.in_errored_case()},
+        {report_id.crashes_on_validate: ErroredTest.in_errored_case()},
     ], stderr
 
 
@@ -661,8 +1099,8 @@ async def test_handles_dead_implementations(succeed_immediately):
         )
 
     assert results == [
-        {miniatures.always_invalid: TestResult.INVALID},
-        {miniatures.always_invalid: TestResult.INVALID},
+        {report_id.always_invalid: TestResult.INVALID},
+        {report_id.always_invalid: TestResult.INVALID},
     ], stderr
     assert "failed to start" in stderr, stderr
 
@@ -706,8 +1144,8 @@ async def test_it_handles_immediately_broken_implementations(fail_immediately):
     assert "failed to start" in stderr, stderr
     assert "BOOM!" in stderr, stderr
     assert results == [
-        {miniatures.always_invalid: TestResult.INVALID},
-        {miniatures.always_invalid: TestResult.INVALID},
+        {report_id.always_invalid: TestResult.INVALID},
+        {report_id.always_invalid: TestResult.INVALID},
     ], stderr
 
 
@@ -731,8 +1169,8 @@ async def test_it_handles_broken_start_implementations(fail_on_start):
     assert "failed to start" in stderr, stderr
     assert "BOOM!" in stderr, stderr
     assert results == [
-        {miniatures.always_invalid: TestResult.INVALID},
-        {miniatures.always_invalid: TestResult.INVALID},
+        {report_id.always_invalid: TestResult.INVALID},
+        {report_id.always_invalid: TestResult.INVALID},
     ], stderr
 
 
@@ -991,8 +1429,8 @@ async def test_fail_fast():
         )
 
     assert results == [
-        {"direct:null": TestResult.VALID},
-        {"direct:null": TestResult.VALID},
+        {"null": TestResult.VALID},
+        {"null": TestResult.VALID},
     ], stderr
     assert stderr != ""
 
@@ -1009,9 +1447,9 @@ async def test_fail_fast_many_tests_at_once():
         )
 
     assert results == [
-        {"direct:null": TestResult.VALID},
-        {"direct:null": TestResult.VALID},
-        {"direct:null": TestResult.VALID},
+        {"null": TestResult.VALID},
+        {"null": TestResult.VALID},
+        {"null": TestResult.VALID},
     ], stderr
     assert stderr != ""
 
@@ -1029,9 +1467,9 @@ async def test_max_fail():
         )
 
     assert results == [
-        {"direct:null": TestResult.VALID},
-        {"direct:null": TestResult.VALID},
-        {"direct:null": TestResult.VALID},
+        {"null": TestResult.VALID},
+        {"null": TestResult.VALID},
+        {"null": TestResult.VALID},
     ], stderr
     assert stderr != ""
 
@@ -1074,7 +1512,7 @@ async def test_filter():
             """,  # noqa: E501
         )
 
-    assert results == [{"direct:null": TestResult.VALID}], stderr
+    assert results == [{"null": TestResult.VALID}], stderr
     assert stderr == ""
 
 
@@ -1094,6 +1532,79 @@ class TestSmoke:
         assert (await command_validator("smoke")).validated(jsonout) == {
             "success": False,
             "dialects": {
+                "v1": [
+                    {
+                        "schema": {
+                            "$schema": "https://json-schema.org/v1",
+                        },
+                        "instances": [
+                            None,
+                            True,
+                            37,
+                            37.37,
+                            "37",
+                            [
+                                37,
+                            ],
+                            {
+                                "foo": 37,
+                            },
+                        ],
+                        "expected": [
+                            {"valid": True},
+                            {"valid": True},
+                            {"valid": True},
+                            {"valid": True},
+                            {"valid": True},
+                            {"valid": True},
+                            {"valid": True},
+                        ],
+                        "results": [
+                            {"valid": False},
+                            {"valid": False},
+                            {"valid": False},
+                            {"valid": False},
+                            {"valid": False},
+                            {"valid": False},
+                            {"valid": False},
+                        ],
+                    },
+                    {
+                        "schema": {
+                            "$schema": "https://json-schema.org/v1",
+                            "not": {
+                                "$schema": "https://json-schema.org/v1",
+                            },
+                        },
+                        "instances": [
+                            None,
+                            True,
+                            37,
+                            37.37,
+                            "37",
+                            [37],
+                            {"foo": 37},
+                        ],
+                        "expected": [
+                            {"valid": False},
+                            {"valid": False},
+                            {"valid": False},
+                            {"valid": False},
+                            {"valid": False},
+                            {"valid": False},
+                            {"valid": False},
+                        ],
+                        "results": [
+                            {"valid": True},
+                            {"valid": True},
+                            {"valid": True},
+                            {"valid": True},
+                            {"valid": True},
+                            {"valid": True},
+                            {"valid": True},
+                        ],
+                    },
+                ],
                 "draft2020-12": [
                     {
                         "schema": {
@@ -1535,6 +2046,7 @@ class TestSmoke:
                 "draft3": [],
                 "draft4": [],
                 "draft6": [],
+                "v1": [],
                 "draft7": [
                     {
                         "expected": [
@@ -1678,6 +2190,7 @@ class TestSmoke:
 
             ## Dialects
 
+            * v1
             * Draft 2020-12
             * Draft 2019-09
             * Draft 7 **(failed)**
@@ -1803,14 +2316,14 @@ class TestSmoke:
             exit_code=EX.DATAERR,  # because indeed invalid isn't always right
         )
         assert (await command_validator("smoke")).validated(jsonout) == {
-            miniatures.passes_smoke: {
+            report_id.passes_smoke: {
                 "success": True,
                 "dialects": [
                     dialect.short_name
                     for dialect in sorted(Dialect.known(), reverse=True)
                 ],
             },
-            miniatures.always_invalid: {
+            report_id.always_invalid: {
                 "success": False,
                 "dialects": {
                     "draft2019-09": [
@@ -1844,6 +2357,40 @@ class TestSmoke:
                             ],
                             "schema": {
                                 "$schema": "https://json-schema.org/draft/2019-09/schema",
+                            },
+                        },
+                    ],
+                    "v1": [
+                        {
+                            "expected": [
+                                {"valid": True},
+                                {"valid": True},
+                                {"valid": True},
+                                {"valid": True},
+                                {"valid": True},
+                                {"valid": True},
+                                {"valid": True},
+                            ],
+                            "instances": [
+                                None,
+                                True,
+                                37,
+                                37.37,
+                                "37",
+                                [37],
+                                {"foo": 37},
+                            ],
+                            "results": [
+                                {"valid": False},
+                                {"valid": False},
+                                {"valid": False},
+                                {"valid": False},
+                                {"valid": False},
+                                {"valid": False},
+                                {"valid": False},
+                            ],
+                            "schema": {
+                                "$schema": "https://json-schema.org/v1",
                             },
                         },
                     ],
@@ -2046,6 +2593,19 @@ class TestSmoke:
         assert stdout == "", stderr
 
 
+def _adjust_rich_box(text):
+    """Adjust Rich box-drawing characters for platform differences.
+
+    When Rich's Console has piped stdout on Windows, it detects a "legacy"
+    console (no VT capability on the pipe) and substitutes ROUNDED box
+    corners (╭╮╰╯) with SQUARE corners (┌┐└┘).  This is a no-op on Linux
+    where Rich always keeps the original ROUNDED characters.
+    """
+    if sys.platform != "win32":
+        return text
+    return text.translate(str.maketrans("╭╮╰╯", "┌┐└┘"))
+
+
 @pytest.mark.asyncio
 async def test_info_pretty():
     stdout, stderr = await bowtie(
@@ -2055,12 +2615,14 @@ async def test_info_pretty():
         "-i",
         miniatures.fake_language_and_os,
     )
-    assert stdout == dedent(
-        """\
+    assert stdout == _adjust_rich_box(
+        dedent(
+            """\
         ╭────────────────┬─────────────────────────────────────────────────────────────╮
         │ implementation │ fake_language_and_os v1.0.0                                 │
         │ language       │ python 1.2.3                                                │
-        │ dialects       │ Draft 2020-12                                               │
+        │ dialects       │ v1                                                          │
+        │                │ Draft 2020-12                                               │
         │                │ Draft 2019-09                                               │
         │                │ Draft 7                                                     │
         │                │ Draft 6                                                     │
@@ -2073,6 +2635,7 @@ async def test_info_pretty():
         ╰────────────────┴─────────────────────────────────────────────────────────────╯
                                        Ran on Linux 4.5.6                               \n\n
         """,  # noqa: E501
+        ),
     )
     assert stderr == ""
 
@@ -2098,6 +2661,7 @@ async def test_info_markdown():
         **os_version**: "{platform.release()}"
         **source**: "https://github.com/bowtie-json-schema/bowtie"
         **dialects**: [
+          "https://json-schema.org/v1",
           "https://json-schema.org/draft/2020-12/schema",
           "https://json-schema.org/draft/2019-09/schema",
           "http://json-schema.org/draft-07/schema#",
@@ -2191,6 +2755,8 @@ async def test_info_valid_markdown():
                   <text>
                   <softbreak>
                   <text>
+                  <softbreak>
+                  <text>
             """,
         ).strip()
     )
@@ -2220,6 +2786,7 @@ async def test_info_json():
         "os": platform.system(),
         "version": "v1.0.0",
         "dialects": [
+            "https://json-schema.org/v1",
             "https://json-schema.org/draft/2020-12/schema",
             "https://json-schema.org/draft/2019-09/schema",
             "http://json-schema.org/draft-07/schema#",
@@ -2246,7 +2813,7 @@ async def test_info_json_multiple_implementations():
     jsonout = _json.loads(stdout)
 
     assert (await command_validator("info")).validated(jsonout) == {
-        miniatures.always_invalid: {
+        report_id.always_invalid: {
             "name": "always_invalid",
             "language": "python",
             "homepage": "https://bowtie.report/",
@@ -2257,6 +2824,7 @@ async def test_info_json_multiple_implementations():
             "os": platform.system(),
             "version": "v1.0.0",
             "dialects": [
+                "https://json-schema.org/v1",
                 "https://json-schema.org/draft/2020-12/schema",
                 "https://json-schema.org/draft/2019-09/schema",
                 "http://json-schema.org/draft-07/schema#",
@@ -2265,7 +2833,7 @@ async def test_info_json_multiple_implementations():
                 "http://json-schema.org/draft-03/schema#",
             ],
         },
-        miniatures.links: {
+        report_id.links: {
             "name": "links",
             "language": "python",
             "homepage": "urn:example",
@@ -2294,8 +2862,9 @@ async def test_info_pretty_links():
         "-i",
         miniatures.fake_language_and_os_with_links,
     )
-    assert stdout == dedent(
-        """\
+    assert stdout == _adjust_rich_box(
+        dedent(
+            """\
         ╭────────────────┬─────────────────────────────────────────────────────────────╮
         │ implementation │ fake_language_and_os_with_links v1.0.0                      │
         │ language       │ python 1.2.3                                                │
@@ -2310,6 +2879,7 @@ async def test_info_pretty_links():
         ╰────────────────┴─────────────────────────────────────────────────────────────╯
                                        Ran on Linux 4.5.6                               \n\n
         """,  # noqa: E501
+        ),
     )
     assert stderr == ""
 
@@ -2330,11 +2900,21 @@ async def test_info_unsuccessful_start(succeed_immediately):
 
 @pytest.mark.asyncio
 async def test_filter_implementations_no_arguments():
-    output, exit_code = pexpect.runu(
-        sys.executable,
-        args=["-m", "bowtie", "filter-implementations"],
-        withexitstatus=True,
-    )
+    if sys.platform == "win32":
+        result = subprocess.run(  # noqa: ASYNC221
+            [sys.executable, "-m", "bowtie", "filter-implementations"],
+            capture_output=True,
+            check=False,
+            env=WIDE_TERMINAL_ENV,
+        )
+        output = result.stdout.decode("utf-8").replace("\r\n", "\n")
+        exit_code = result.returncode
+    else:
+        output, exit_code = pexpect.runu(
+            sys.executable,
+            args=["-m", "bowtie", "filter-implementations"],
+            withexitstatus=True,
+        )
     expected = sorted(Implementation.known())
     assert (sorted(output.splitlines()), exit_code) == (expected, 0)
 
@@ -2393,29 +2973,63 @@ async def test_filter_implementations_both_language_and_dialect():
 
 @pytest.mark.asyncio
 async def test_filter_implementations_direct():
-    output, exit_code = pexpect.runu(
-        sys.executable,
-        args=["-m", "bowtie", "filter-implementations", "--direct"],
-        withexitstatus=True,
-    )
+    if sys.platform == "win32":
+        result = subprocess.run(  # noqa: ASYNC221
+            [
+                sys.executable,
+                "-m",
+                "bowtie",
+                "filter-implementations",
+                "--direct",
+            ],
+            capture_output=True,
+            check=False,
+            env=WIDE_TERMINAL_ENV,
+        )
+        output = result.stdout.decode("utf-8").replace("\r\n", "\n")
+        exit_code = result.returncode
+    else:
+        output, exit_code = pexpect.runu(
+            sys.executable,
+            args=["-m", "bowtie", "filter-implementations", "--direct"],
+            withexitstatus=True,
+        )
     expected = sorted(KNOWN_DIRECT)
     assert (sorted(output.splitlines()), exit_code) == (expected, 0)
 
 
 @pytest.mark.asyncio
 async def test_filter_implementations_direct_by_language():
-    output, exit_code = pexpect.runu(
-        sys.executable,
-        args=[
-            "-m",
-            "bowtie",
-            "filter-implementations",
-            "--direct",
-            "--language",
-            "python",
-        ],
-        withexitstatus=True,
-    )
+    if sys.platform == "win32":
+        result = subprocess.run(  # noqa: ASYNC221
+            [
+                sys.executable,
+                "-m",
+                "bowtie",
+                "filter-implementations",
+                "--direct",
+                "--language",
+                "python",
+            ],
+            capture_output=True,
+            check=False,
+            env=WIDE_TERMINAL_ENV,
+        )
+        output = result.stdout.decode("utf-8").replace("\r\n", "\n")
+        exit_code = result.returncode
+    else:
+        output, exit_code = pexpect.runu(
+            sys.executable,
+            args=[
+                "-m",
+                "bowtie",
+                "filter-implementations",
+                "--direct",
+                "--language",
+                "python",
+            ],
+            withexitstatus=True,
+        )
     expected = sorted(d for d in KNOWN_DIRECT if d.startswith("python-"))
     assert (sorted(output.splitlines()), exit_code) == (expected, 0)
 
@@ -2581,82 +3195,6 @@ async def test_validate(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_combine_two_reports(tmp_path):
-    tmp_path.joinpath("schema.json").write_text("{}")
-    tmp_path.joinpath("instance.json").write_text("12")
-
-    report1_path = tmp_path / "report1.json"
-    report2_path = tmp_path / "report2.json"
-
-    stdout1, _ = await bowtie(
-        "validate",
-        "-i",
-        "direct:null",
-        tmp_path / "schema.json",
-        tmp_path / "instance.json",
-    )
-    report1_path.write_text(stdout1)
-
-    stdout2, _ = await bowtie(
-        "validate",
-        "-i",
-        miniatures.always_invalid,
-        tmp_path / "schema.json",
-        tmp_path / "instance.json",
-    )
-    report2_path.write_text(stdout2)
-
-    combined_stdout, _ = await bowtie(
-        "combine",
-        str(report1_path),
-        str(report2_path),
-    )
-
-    report = Report.from_serialized(combined_stdout.splitlines())
-    assert len(report.implementations) == 2  # noqa: PLR2004
-    assert report.total_tests == 1
-
-
-@pytest.mark.asyncio
-async def test_combine_errors_on_mismatched_dialects(tmp_path):
-    tmp_path.joinpath("schema.json").write_text("{}")
-    tmp_path.joinpath("instance.json").write_text("12")
-
-    report1_path = tmp_path / "report1.json"
-    report2_path = tmp_path / "report2.json"
-
-    stdout1, _ = await bowtie(
-        "validate",
-        "-i",
-        "direct:null",
-        "-D",
-        "2020",
-        tmp_path / "schema.json",
-        tmp_path / "instance.json",
-    )
-    report1_path.write_text(stdout1)
-
-    stdout2, _ = await bowtie(
-        "validate",
-        "-i",
-        miniatures.always_invalid,
-        "-D",
-        "7",
-        tmp_path / "schema.json",
-        tmp_path / "instance.json",
-    )
-    report2_path.write_text(stdout2)
-
-    _, stderr = await bowtie(
-        "combine",
-        str(report1_path),
-        str(report2_path),
-        exit_code=EX.DATAERR,
-    )
-    assert "dialect" in stderr.lower()
-
-
-@pytest.mark.asyncio
 @pytest.mark.json
 async def test_summary_show_failures_json(tmp_path):
     tmp_path.joinpath("schema.json").write_text("{}")
@@ -2689,11 +3227,11 @@ async def test_summary_show_failures_json(tmp_path):
 
     assert (await command_validator("summary")).validated(jsonout) == [
         [
-            "direct:null",
+            "null",
             dict(failed=0, skipped=0, errored=0),
         ],
         [
-            miniatures.always_invalid,
+            report_id.always_invalid,
             dict(failed=2, skipped=0, errored=0),
         ],
     ]
@@ -2882,6 +3420,34 @@ async def test_summary_failures_valid_markdown(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("format", ["pretty", "markdown"])
+async def test_summary_validation_without_expected_results(format, tmp_path):
+    """
+    Reports from ``bowtie validate`` have no expected results but still
+    can be summarized.
+    """
+    tmp_path.joinpath("schema.json").write_text("{}")
+    tmp_path.joinpath("instance.json").write_text("12")
+
+    validate_stdout, _ = await bowtie(
+        "validate",
+        "-i",
+        ARBITRARY,
+        tmp_path / "schema.json",
+        tmp_path / "instance.json",
+    )
+
+    stdout, stderr = await bowtie(
+        "summary",
+        "--format",
+        format,
+        stdin=validate_stdout,
+    )
+    assert stderr == ""
+    assert "invalid" in stdout
+
+
+@pytest.mark.asyncio
 async def test_validate_no_tests(tmp_path):
     """
     Don't bother starting up if we have nothing to run.
@@ -2939,14 +3505,14 @@ async def test_summary_show_validation_json(envsonschema):
                 [
                     12,
                     {
-                        "direct:null": "valid",
+                        "null": "valid",
                         tag("envsonschema"): "valid",
                     },
                 ],
                 [
                     12.5,
                     {
-                        "direct:null": "valid",
+                        "null": "valid",
                         tag("envsonschema"): "invalid",
                     },
                 ],
@@ -2958,7 +3524,7 @@ async def test_summary_show_validation_json(envsonschema):
                 [
                     "{}",
                     {
-                        "direct:null": "valid",
+                        "null": "valid",
                         tag("envsonschema"): "error",
                     },
                 ],
@@ -2970,14 +3536,14 @@ async def test_summary_show_validation_json(envsonschema):
                 [
                     "{}",
                     {
-                        "direct:null": "valid",
+                        "null": "valid",
                         tag("envsonschema"): "error",
                     },
                 ],
                 [
                     37,
                     {
-                        "direct:null": "valid",
+                        "null": "valid",
                         tag("envsonschema"): "error",
                     },
                 ],
@@ -2989,7 +3555,7 @@ async def test_summary_show_validation_json(envsonschema):
                 [
                     "",
                     {
-                        "direct:null": "valid",
+                        "null": "valid",
                         tag("envsonschema"): "skipped",
                     },
                 ],
@@ -3001,7 +3567,7 @@ async def test_summary_show_validation_json(envsonschema):
                 [
                     "",
                     {
-                        "direct:null": "valid",
+                        "null": "valid",
                         tag("envsonschema"): "skipped",
                     },
                 ],
@@ -3013,14 +3579,14 @@ async def test_summary_show_validation_json(envsonschema):
                 [
                     "",
                     {
-                        "direct:null": "valid",
+                        "null": "valid",
                         tag("envsonschema"): "error",
                     },
                 ],
                 [
                     12,
                     {
-                        "direct:null": "valid",
+                        "null": "valid",
                         tag("envsonschema"): "invalid",
                     },
                 ],
@@ -3032,7 +3598,7 @@ async def test_summary_show_validation_json(envsonschema):
                 [
                     "",
                     {
-                        "direct:null": "valid",
+                        "null": "valid",
                         tag("envsonschema"): "error",
                     },
                 ],
@@ -3040,64 +3606,6 @@ async def test_summary_show_validation_json(envsonschema):
         ],
     ], run_stderr
     assert stderr == ""
-
-
-@pytest.mark.asyncio
-@pytest.mark.containers
-async def test_badges(envsonschema, tmp_path):
-    site = tmp_path / "site"
-    site.mkdir()
-
-    raw = """
-        {"description":"one","schema":{"type": "integer"},"tests":[{"description":"valid:1","instance":12},{"description":"valid:0","instance":12.5}]}
-        {"description":"two","schema":{"type": "string"},"tests":[{"description":"crash:1","instance":"{}"}]}
-        {"description":"crash:1","schema":{"type": "number"},"tests":[{"description":"three","instance":"{}"}, {"description": "another", "instance": 37}]}
-        {"description":"four","schema":{"type": "array"},"tests":[{"description":"skip:message=foo","instance":""}]}
-        {"description":"skip:message=bar","schema":{"type": "boolean"},"tests":[{"description":"five","instance":""}]}
-        {"description":"six","schema":{"type": "array"},"tests":[{"description":"error:message=boom","instance":""}, {"description":"valid:0", "instance":12}]}
-        {"description":"error:message=boom","schema":{"type": "array"},"tests":[{"description":"seven","instance":""}]}
-    """  # noqa: E501
-
-    run_stdout, _ = await bowtie(
-        "run",
-        "-i",
-        envsonschema,
-        stdin=dedent(raw.strip("\n")),
-    )
-
-    site.joinpath("draft2020-12.json").write_text(run_stdout)
-
-    _stdout, _stderr = await bowtie("badges", "--site", site)
-
-    badges = site / "badges"
-    assert {path.relative_to(badges) for path in badges.rglob("*")} == {
-        Path("python-envsonschema"),
-        Path("python-envsonschema/supported_versions.json"),
-        Path("python-envsonschema/compliance"),
-        Path("python-envsonschema/compliance/draft2020-12.json"),
-    }
-
-
-@pytest.mark.asyncio
-async def test_badges_nothing_ran(tmp_path):
-    run_stdout, _ = await bowtie(
-        "run",
-        "-i",
-        ARBITRARY,
-        stdin="",
-        exit_code=-1,  # no test cases run causes a non-zero here
-    )
-
-    badges = tmp_path / "badges"
-    stdout, stderr = await bowtie(
-        "badges",
-        badges,
-        stdin=run_stdout,
-        exit_code=2,  # comes from click
-    )
-    assert stdout == ""
-    assert stderr != ""
-    assert not badges.is_dir()
 
 
 @pytest.mark.asyncio
@@ -3617,7 +4125,7 @@ async def test_run_mismatched_dialect():
             """,  # noqa: E501
         )
 
-    assert results == [{miniatures.always_invalid: TestResult.INVALID}], stderr
+    assert results == [{report_id.always_invalid: TestResult.INVALID}], stderr
     assert "$schema keyword does not" in stderr, stderr
 
 
@@ -3630,7 +4138,7 @@ async def test_run_registry_metasschema_not_mismatched_dialect():
             """,  # noqa: E501
         )
 
-    assert results == [{miniatures.always_invalid: TestResult.INVALID}], stderr
+    assert results == [{report_id.always_invalid: TestResult.INVALID}], stderr
     assert stderr == ""
 
 
@@ -3643,7 +4151,7 @@ async def test_run_registry_metasschema_still_mismatched_dialect():
             """,  # noqa: E501
         )
 
-    assert results == [{miniatures.always_invalid: TestResult.INVALID}], stderr
+    assert results == [{report_id.always_invalid: TestResult.INVALID}], stderr
     assert "$schema keyword does not" in stderr, stderr
 
 
@@ -3661,7 +4169,7 @@ async def test_run_mismatched_dialect_total_junk():
             """,  # noqa: E501
         )
 
-    assert results == [{miniatures.always_invalid: TestResult.INVALID}], stderr
+    assert results == [{report_id.always_invalid: TestResult.INVALID}], stderr
     assert stderr == ""
 
 
@@ -3690,7 +4198,7 @@ async def test_run_boolean_schema(tmp_path):
             """,  # noqa: E501
         )
 
-    assert results == [{miniatures.always_invalid: TestResult.INVALID}], stderr
+    assert results == [{report_id.always_invalid: TestResult.INVALID}], stderr
     assert stderr == "", stderr
 
 
@@ -3907,14 +4415,18 @@ async def test_container_connectables(
     assert stderr == ""
 
     report = Report.from_serialized(stdout.splitlines())
+    # A report identifies an implementation transport-free, so the container
+    # connectables show up under their report id, not the `container:` string.
+    envsonschema_id = Connectable.from_str(envsonschema_container).report_id
+    lintsonschema_id = Connectable.from_str(lintsonschema_container).report_id
     assert [
         [test_results for _, test_results in results]
         for _, results in report.cases_with_results()
     ] == [
         [
             {
-                envsonschema_container: TestResult.INVALID,
-                lintsonschema_container: TestResult.VALID,
+                envsonschema_id: TestResult.INVALID,
+                lintsonschema_id: TestResult.VALID,
             },
         ],
     ], stderr
@@ -3940,7 +4452,7 @@ async def test_direct_connectable_python_jsonschema(tmp_path):
         [test_results for _, test_results in results]
         for _, results in report.cases_with_results()
     ] == [
-        [{"direct:python-jsonschema": TestResult.VALID}],
+        [{"python-jsonschema": TestResult.VALID}],
     ], stderr
 
 
@@ -4119,7 +4631,7 @@ class TestBenchmarkRun:
 
             Benchmark: Tests with benchmark
 
-            | Test Name | direct:python-jsonschema |
+            | Test Name | python-jsonschema |
         """,
         ).strip()
 
@@ -4169,7 +4681,7 @@ class TestBenchmarkRun:
 
             Benchmark: Tests with varying Array Size
 
-            | Test Name | direct:python-jsonschema |
+            | Test Name | python-jsonschema |
         """,
         ).strip()
 
@@ -4177,7 +4689,7 @@ class TestBenchmarkRun:
             """
             Benchmark: Tests with benchmark 2
 
-            | Test Name | direct:python-jsonschema |
+            | Test Name | python-jsonschema |
         """,
         ).strip()
 
@@ -4245,3 +4757,559 @@ class TestFilterBenchmarks:
         )
         assert stdout == ""
         assert stderr == ""
+
+
+@pytest.mark.asyncio
+async def test_annotation_suite(tmp_path):
+    definitions = tmp_path / "annotations/tests/definitions.json"
+    definitions.parent.mkdir(parents=True)
+    definitions.write_text(
+        _json.dumps(
+            {
+                "suite": [
+                    {
+                        "description": "the case",
+                        "schema": {
+                            "$schema": "http://json-schema.org/draft-07/schema#",
+                            "type": "string",
+                            "title": "A string",
+                        },
+                        "tests": [
+                            {
+                                "description": "one",
+                                "instance": "foo",
+                                "assertions": [
+                                    {
+                                        "location": "",
+                                        "keyword": "title",
+                                        "expected": {
+                                            "#": "A string",
+                                        },
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                ],
+            },
+        ),
+    )
+
+    stdout, _stderr = await bowtie(
+        "annotation-suite",
+        "-i",
+        miniatures.always_invalid,
+        "--dialect",
+        "7",
+        definitions,
+    )
+    report = Report.from_serialized(stdout.splitlines())
+    cases = list(report.cases_with_results())
+
+    assert report.metadata.dialect == Dialect.by_short_name()["draft7"]
+    assert len(cases) == 1
+    assert cases[0][0].description == "the case"
+
+
+@pytest.mark.asyncio
+@pytest.mark.containers
+@pytest.mark.json
+async def test_annotation_suite_end_to_end(envsonschema, tmp_path):
+    """
+    Annotations produced by a harness are matched against the assertions.
+    """
+    annotate = (
+        "annotate:keyword=title,instanceLocation=,"
+        "keywordLocation=#/title,annotation=Foo"
+    )
+    definitions = tmp_path / "annotations/tests/definitions.json"
+    definitions.parent.mkdir(parents=True)
+    definitions.write_text(
+        _json.dumps(
+            {
+                "suite": [
+                    {
+                        "description": "the case",
+                        "schema": {"title": "Foo"},
+                        "tests": [
+                            {
+                                "description": f"valid:1 {annotate}",
+                                "instance": 37,
+                                "assertions": [
+                                    {
+                                        "location": "",
+                                        "keyword": "title",
+                                        "expected": {"#": "Foo"},
+                                    },
+                                ],
+                            },
+                            {
+                                "description": "valid:1",
+                                "instance": 37,
+                                "assertions": [
+                                    {
+                                        "location": "",
+                                        "keyword": "title",
+                                        "expected": {"#": "Foo"},
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                ],
+            },
+        ),
+    )
+
+    stdout, _stderr = await bowtie(
+        "annotation-suite",
+        "-i",
+        envsonschema,
+        "--dialect",
+        "2020",
+        definitions,
+    )
+
+    jsonout, stderr = await bowtie(
+        "summary",
+        "--format",
+        "json",
+        "--show",
+        "failures",
+        stdin=stdout,
+        json=True,
+        exit_code=EX.DATAERR,
+    )
+    assert stderr == ""
+    assert jsonout == [
+        [tag("envsonschema"), dict(failed=1, skipped=0, errored=0)],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_annotation_suite_no_test_cases(tmp_path):
+    """
+    Don't emit an empty (all-passing) report if we found nothing to run.
+    """
+    tests = tmp_path / "annotations/tests"
+    tests.mkdir(parents=True)
+    tests.joinpath("not-a-suite.json").write_text('{"$schema": "boo"}')
+
+    stdout, stderr = await bowtie(
+        "annotation-suite",
+        "-i",
+        ARBITRARY,
+        tests,
+        exit_code=EX.NOINPUT,
+    )
+    assert stdout == ""
+    assert "No test cases ran." in stderr
+
+
+@pytest.mark.asyncio
+async def test_annotation_suite_default_dialect(tmp_path):
+    """
+    Without --dialect, the annotation suite runs under the latest dialect.
+    """
+    definitions = tmp_path / "annotations/tests/definitions.json"
+    definitions.parent.mkdir(parents=True)
+    definitions.write_text(
+        _json.dumps(
+            {
+                "suite": [
+                    {
+                        "description": "the case",
+                        "schema": {"type": "string", "title": "A string"},
+                        "tests": [
+                            {
+                                "instance": "foo",
+                                "assertions": [
+                                    {
+                                        "location": "",
+                                        "keyword": "title",
+                                        "expected": {"#": "A string"},
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                ],
+            },
+        ),
+    )
+
+    stdout, _stderr = await bowtie(
+        "annotation-suite",
+        "-i",
+        miniatures.always_invalid,
+        definitions,
+    )
+    report = Report.from_serialized(stdout.splitlines())
+
+    assert report.metadata.dialect == Dialect.latest()
+
+
+@pytest.mark.asyncio
+@pytest.mark.json
+async def test_annotation_suite_expected_results_survive_the_report(tmp_path):
+    """
+    Annotation assertions round-trip through a written report,
+    so failures are still visible when re-reading it.
+    """
+    definitions = tmp_path / "annotations/tests/definitions.json"
+    definitions.parent.mkdir(parents=True)
+    definitions.write_text(
+        _json.dumps(
+            {
+                "suite": [
+                    {
+                        "description": "the case",
+                        "schema": {
+                            "$schema": "http://json-schema.org/draft-07/schema#",
+                            "type": "string",
+                            "title": "A string",
+                        },
+                        "tests": [
+                            {
+                                "description": "one",
+                                "instance": "foo",
+                                "assertions": [
+                                    {
+                                        "location": "",
+                                        "keyword": "title",
+                                        "expected": {
+                                            "#": "A string",
+                                        },
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                ],
+            },
+        ),
+    )
+
+    stdout, _ = await bowtie(
+        "annotation-suite",
+        "-i",
+        miniatures.always_invalid,
+        "--dialect",
+        "7",
+        definitions,
+    )
+
+    (result_line,) = [
+        line
+        for line in map(_json.loads, stdout.splitlines())
+        if "expected" in line
+    ]
+    assert result_line["expected"] == [
+        [
+            {
+                "instanceLocation": "",
+                "keyword": "title",
+                "expected": {"#/title": "A string"},
+            },
+        ],
+    ]
+
+    jsonout, stderr = await bowtie(
+        "summary",
+        "--format",
+        "json",
+        "--show",
+        "failures",
+        stdin=stdout,
+        json=True,
+    )
+    assert jsonout == [
+        [report_id.always_invalid, dict(failed=0, skipped=1, errored=0)],
+    ]
+    assert stderr == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.json
+async def test_summary_annotation_failures_json():
+    """
+    Mismatching annotations are counted as failures when re-read.
+    """
+    raw = "\n".join(
+        [
+            FAUX_REPORT_HEADER,
+            _json.dumps(
+                {
+                    "seq": 1,
+                    "case": {
+                        "description": "the case",
+                        "schema": {"type": "string"},
+                        "tests": [
+                            {
+                                "description": "one",
+                                "instance": "foo",
+                                "assertions": [
+                                    {
+                                        "instanceLocation": "",
+                                        "keyword": "title",
+                                        "expected": {"#/title": "A string"},
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                },
+            ),
+            _json.dumps(
+                {
+                    "seq": 1,
+                    "implementation": "direct:miniatures:always_invalid",
+                    "expected": [
+                        [
+                            {
+                                "instanceLocation": "",
+                                "keyword": "title",
+                                "expected": {"#/title": "A string"},
+                            },
+                        ],
+                    ],
+                    "results": [
+                        {
+                            "valid": True,
+                            "annotations": [
+                                {
+                                    "keyword": "title",
+                                    "instanceLocation": "",
+                                    "keywordLocation": "#/title",
+                                    "annotation": "Wrong!",
+                                },
+                            ],
+                        },
+                    ],
+                },
+            ),
+            _json.dumps({"did_fail_fast": False}),
+        ],
+    )
+
+    jsonout, stderr = await bowtie(
+        "summary",
+        "--format",
+        "json",
+        "--show",
+        "failures",
+        stdin=raw,
+        json=True,
+        exit_code=EX.DATAERR,
+    )
+    assert stderr == ""
+    assert jsonout == [
+        [
+            "direct:miniatures:always_invalid",
+            dict(failed=1, skipped=0, errored=0),
+        ],
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.json
+async def test_run_output_annotations():
+    """
+    Asking for annotations output reaches the implementation.
+
+    Direct connectables cannot collect annotations, so they skip.
+    """
+    raw = _json.dumps(
+        {
+            "description": "the case",
+            "schema": {"type": "string", "title": "A string"},
+            "tests": [
+                {
+                    "description": "one",
+                    "instance": "foo",
+                    "assertions": [
+                        {
+                            "instanceLocation": "",
+                            "keyword": "title",
+                            "expected": {"#/title": "A string"},
+                        },
+                    ],
+                },
+            ],
+        },
+    )
+
+    run_stdout, _ = await bowtie(
+        "run",
+        "-i",
+        "direct:python-jsonschema",
+        "--output",
+        "annotations",
+        stdin=f"{raw}\n",
+    )
+
+    jsonout, stderr = await bowtie(
+        "summary",
+        "--format",
+        "json",
+        "--show",
+        "failures",
+        stdin=run_stdout,
+        json=True,
+    )
+    assert stderr == ""
+    assert jsonout == [
+        ["python-jsonschema", dict(failed=0, skipped=1, errored=0)],
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.json
+async def test_summary_pre_output_format_report():
+    """
+    Reports written before expected results became objects still summarize.
+    """
+    raw = "\n".join(
+        [
+            FAUX_REPORT_HEADER,
+            _json.dumps(
+                {
+                    "seq": 1,
+                    "case": {
+                        "description": "the case",
+                        "schema": {"type": "string"},
+                        "tests": [
+                            {
+                                "description": "one",
+                                "instance": "foo",
+                                "valid": True,
+                            },
+                            {
+                                "description": "two",
+                                "instance": 37,
+                                "valid": False,
+                            },
+                        ],
+                    },
+                },
+            ),
+            _json.dumps(
+                {
+                    "seq": 1,
+                    "implementation": "direct:miniatures:always_invalid",
+                    "expected": [True, False],
+                    "results": [{"valid": True}, {"valid": False}],
+                },
+            ),
+            _json.dumps({"did_fail_fast": False}),
+        ],
+    )
+
+    jsonout, stderr = await bowtie(
+        "summary",
+        "--format",
+        "json",
+        "--show",
+        "failures",
+        stdin=raw,
+        json=True,
+    )
+
+    assert stderr == ""
+    assert jsonout == [
+        [
+            "direct:miniatures:always_invalid",
+            dict(failed=0, skipped=0, errored=0),
+        ],
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.json
+async def test_summary_annotation_json():
+    """
+    Annotation reports summarize with per-implementation statuses.
+    """
+    raw = "\n".join(
+        [
+            FAUX_REPORT_HEADER,
+            _json.dumps(
+                {
+                    "seq": 1,
+                    "case": {
+                        "description": "the case",
+                        "schema": {"type": "string"},
+                        "tests": [
+                            {
+                                "description": "one",
+                                "instance": "foo",
+                                "assertions": [
+                                    {
+                                        "instanceLocation": "",
+                                        "keyword": "title",
+                                        "expected": {"#/title": "A string"},
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                },
+            ),
+            _json.dumps(
+                {
+                    "seq": 1,
+                    "implementation": "direct:miniatures:always_invalid",
+                    "expected": [
+                        [
+                            {
+                                "instanceLocation": "",
+                                "keyword": "title",
+                                "expected": {"#/title": "A string"},
+                            },
+                        ],
+                    ],
+                    "results": [
+                        {
+                            "valid": True,
+                            "annotations": [
+                                {
+                                    "keyword": "title",
+                                    "instanceLocation": "",
+                                    "keywordLocation": "#/title",
+                                    "annotation": "A string",
+                                },
+                            ],
+                        },
+                    ],
+                },
+            ),
+            _json.dumps({"did_fail_fast": False}),
+        ],
+    )
+
+    jsonout, stderr = await bowtie(
+        "summary",
+        "--format",
+        "json",
+        stdin=raw,
+        json=True,
+    )
+
+    assert stderr == ""
+    assert (await command_validator("summary")).validated(jsonout) == [
+        {
+            "description": "the case",
+            "schema": {"type": "string"},
+            "tests": [
+                {
+                    "instance": "foo",
+                    "results": {
+                        "direct:miniatures:always_invalid": {
+                            "status": "pass",
+                            "actual": {"": {"title": {"#/title": "A string"}}},
+                        },
+                    },
+                },
+            ],
+        },
+    ]

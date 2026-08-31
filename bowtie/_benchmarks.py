@@ -1231,7 +1231,7 @@ class Benchmarker:
                 if dialect not in implementation.info.dialects:
                     incompatible_connectables.append(connectable)
                     continue
-                acknowledged[connectable.to_terse()] = implementation.info
+                acknowledged[connectable.report_id] = implementation.info
                 compatible_connectables.append(connectable)
 
         with Progress(
@@ -1308,9 +1308,13 @@ class Benchmarker:
                             )
                             output = ""
                             while run_needed:
+                                # Keep the tempfile reopenable by subprocesses
+                                # on Windows (which holds exclusive locks).
                                 with tempfile.NamedTemporaryFile(
                                     delete=True,
+                                    delete_on_close=False,
                                 ) as fp:
+                                    fp.close()
                                     try:
                                         output = await self._run_benchmark(
                                             benchmark_case,
@@ -1320,7 +1324,7 @@ class Benchmarker:
                                         )
                                     except BowtieRunError as err:
                                         got_connectable_result(
-                                            connectable.to_terse(),
+                                            connectable.report_id,
                                             "Errored",
                                             0,
                                             [1e9]
@@ -1348,7 +1352,7 @@ class Benchmarker:
                                         ]
 
                                         run_needed = got_connectable_result(
-                                            connectable.to_terse(),
+                                            connectable.report_id,
                                             output,
                                             retries_allowed,
                                             measured_time_values,
@@ -1394,12 +1398,24 @@ class Benchmarker:
         if "dialect" in benchmark_dict:
             benchmark_dict.pop("dialect")
 
+        # Keep the tempfile reopenable by subprocesses on Windows
+        # (which holds exclusive locks on NamedTemporaryFile handles).
         with tempfile.NamedTemporaryFile(
             delete=True,
+            delete_on_close=False,
         ) as fp:
             path = Path(fp.name)
-            path.write_text(json.dumps(benchmark_dict))  # noqa: ASYNC240
+            fp.close()
+            path.write_text(  # noqa: ASYNC240
+                json.dumps(benchmark_dict),
+                encoding="utf-8",
+            )
             return await self._pyperf_benchmark_command(
+                # Run Bowtie via the current interpreter rather than relying on
+                # a `bowtie` executable being on PATH (it isn't when Bowtie is
+                # run as `python -m bowtie`, e.g. in the test suite).
+                sys.executable,
+                "-m",
                 "bowtie",
                 "run",
                 "-i",
@@ -1434,15 +1450,30 @@ class Benchmarker:
         connectable_id: ConnectableId,
         name: str,
     ):
-        stdout_fd = "1"
+        # On Windows, pyperf's --pipe flag fails because
+        # msvcrt.open_osfhandle() cannot handle an asyncio subprocess
+        # pipe.  Write results to a temp file instead.
+        # pyperf refuses to overwrite existing files, so we reserve
+        # a unique name and delete it before handing it to pyperf.
+        if sys.platform == "win32":
+            result_file = tempfile.NamedTemporaryFile(  # noqa: SIM115
+                delete=False,
+                suffix=".json",
+            )
+            result_path = result_file.name
+            result_file.close()
+            Path(result_path).unlink()  # noqa: ASYNC240
+            pyperf_output_args = ["--output", result_path]
+        else:
+            result_path = None
+            pyperf_output_args = ["--pipe", "1"]
 
         output, err = await self._run_subprocess(
             sys.executable,
             "-m",
             "pyperf",
             "command",
-            "--pipe",
-            stdout_fd,
+            *pyperf_output_args,
             "--copy-env",
             "--processes",
             str(self._num_runs),
@@ -1466,5 +1497,9 @@ class Benchmarker:
             if inner_err:
                 raise BowtieRunError(inner_err.decode(), connectable_id)
             raise PyperfError(err.decode())
+
+        if sys.platform == "win32":
+            output = Path(result_path).read_bytes()  # noqa: ASYNC240
+            Path(result_path).unlink(missing_ok=True)  # noqa: ASYNC240
 
         return output

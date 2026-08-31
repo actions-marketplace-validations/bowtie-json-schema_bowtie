@@ -44,10 +44,10 @@ class Runner:
     def cmd_start(self, version):
         assert version == 1
         self._started = True
+        os_release = platform.freedesktop_os_release()
         return dict(
             version=1,
             implementation=dict(
-                language="python",
                 name="jsonschema",
                 version=jsonschema_version,
                 homepage="https://python-jsonschema.readthedocs.io/",
@@ -64,9 +64,10 @@ class Runner:
                     "http://json-schema.org/draft-04/schema#",
                     "http://json-schema.org/draft-03/schema#",
                 ],
-                os=platform.system(),
-                os_version=platform.release(),
+                language="python",
                 language_version=platform.python_version(),
+                os=os_release["ID"],
+                os_version=os_release["VERSION_ID"],
             ),
         )
 
@@ -79,8 +80,14 @@ class Runner:
             )
         return dict(ok=True)
 
-    def cmd_run(self, case, seq):
+    def cmd_run(self, case, seq, output="flag"):
         assert self._started, "Not started!"
+        if output == "annotations":
+            skipped = dict(
+                skipped=True,
+                message="jsonschema does not support annotation collection",
+            )
+            return dict(seq=seq, results=[skipped for _ in case["tests"]])
         schema = case["schema"]
         try:
             Validator = validator_for(schema, self._DefaultValidator)

@@ -22,13 +22,15 @@ jobs:
     outputs:
       dialects: ${{ steps.dialects-matrix.outputs.dialects }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Collect supported dialects
         id: dialects-matrix
         run: |
-          printf 'dialects=%s\n' "$(jq -c '[.[].shortName]' data/dialects.json)" >> $GITHUB_OUTPUT
+          # A prerelease dialect has no benchmarks and no harnesses
+          # declaring it, so its merge step would find no artifacts.
+          printf 'dialects=%s\n' "$(jq -c '[.[] | select(.prerelease != true) | .shortName]' data/dialects.json)" >> $GITHUB_OUTPUT
 
   benchmark_files:
     name: Collect Benchmark Files
@@ -37,7 +39,7 @@ jobs:
     outputs:
       dialect_benchmarks: ${{ steps.benchmarks.outputs.dialect_benchmarks }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -76,7 +78,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJson(needs.benchmark_files.outputs.dialect_benchmarks) }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -110,7 +112,7 @@ jobs:
         dialect: ${{ fromJson(needs.dialects.outputs.dialects) }}
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -122,7 +124,7 @@ jobs:
           merge-multiple: true
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57 # v8.0.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true
 
@@ -161,7 +163,7 @@ jobs:
 
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 

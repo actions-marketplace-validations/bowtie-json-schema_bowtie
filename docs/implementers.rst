@@ -79,16 +79,37 @@ If you're not, there shouldn't be a need to be an expert neither in the language
     Bowtie certainly aims to support all implementations and architectures, so if you're writing a harness for a drastically different architecture, you'll need to adjust what is below to suit.
 
 For the purposes of this tutorial, we'll write support for a :github:`Lua implementation of JSON Schema <api7/jsonschema>` (one which calls itself simply ``jsonschema`` within the Lua ecosystem, as many implementations tend to).
-Bowtie of course already supports this implementation officially, so if you want to see the final result either now or at the end of this tutorial, it's :gh:`here <tree/main/implementations/lua-jsonschema>`.
+Bowtie of course already supports this implementation officially, so if you want to see the final result either now or at the end of this tutorial, it's :org:`here <lua-jsonschema>`.
 If you're not already familiar with Lua as a programming language, the below won't serve as a full tutorial of course, but you still should be able to follow along; it's a fairly simple one.
 
 Let's get a Hello World container running which we'll turn into our test harness.
 
 Create a directory somewhere, and within it create a ``Dockerfile`` with these contents:
 
-.. literalinclude:: ../implementations/lua-jsonschema/Dockerfile
-    :language: Dockerfile
+.. code-block:: Dockerfile
     :emphasize-lines: 1,8,10-12
+
+    FROM alpine:3.24.1 AS builder
+
+    RUN apk add --no-cache \
+        build-base \
+        lua5.1-dev \
+        luarocks5.1 \
+        pcre-dev \
+     && luarocks-5.1 install jsonschema
+
+    FROM alpine:3.24.1
+    WORKDIR /usr/src/myapp
+
+    RUN apk add --no-cache \
+        lsb-release-minimal \
+        pcre \
+        luajit
+    COPY --from=builder /usr/local/lib/lua /usr/local/lib/lua
+    COPY --from=builder /usr/local/share/lua /usr/local/share/lua
+    COPY json.lua bowtie_jsonschema.lua ./
+
+    CMD ["luajit", "bowtie_jsonschema.lua"]
 
 Most of the above is slightly *more* complicated than you're likely to need for your own language, and has to do with some Lua-specific issues that are uninteresting to discuss in detail (which essentially relate to installing Lua's package manager and a library for JSON serialization).
 
@@ -110,11 +131,9 @@ and build the image (below using ``podman`` but if you're using ``docker``, just
 
 .. note::
 
-    If you are indeed using ``podman``, you must ensure you have set the ``DOCKER_HOST`` environment variable in the environment in which you invoke ``bowtie``.
+    Bowtie drives whichever container engine it finds installed, so using ``podman`` needs no further setup.
 
-    This ensures ``bowtie`` can speak the Docker API to your ``podman`` installation (which is needed because the API client used within Bowtie is agnostic, but speaks the Docker API, which ``podman`` supports as well).
-
-    Further information may be found `here <https://podman-desktop.io/docs/migrating-from-docker/using-the-docker_host-environment-variable>`_.
+    If you have more than one installed, set the ``BOWTIE_ENGINE`` environment variable to the name of the one you want (``docker``, ``podman`` or ``container``).
 
 If everything went well, running:
 
@@ -438,6 +457,9 @@ Let's take a first pass at implementing the ``run`` command, whose input looks l
     :dedent:
 
 ``run`` requests contain a test case (a schema with tests), alongside a ``seq`` parameter which is simply an identifier for the request and needs to be included in the response we write back.
+They also contain an ``output`` parameter indicating which output format Bowtie wants results in -- ``flag``, where each test result is simply a boolean ``valid`` saying whether the instance was valid under the schema, or ``annotations``, where each result additionally contains the `annotations <https://json-schema.org/draft/2020-12/json-schema-core#name-annotations>`_ collected while evaluating the instance.
+Validation runs (such as this tutorial's, or `bowtie suite <cli:suite>`) ask for ``flag`` output; ``annotations`` is asked for by `bowtie annotation-suite <cli:annotation-suite>`, and a harness whose implementation cannot collect annotations should skip such tests.
+Annotations-format results follow the ``tag:bowtie.report,2026:output:annotations`` schema (found in Bowtie's ``schemas/output/annotations.json``): each annotation carries the ``keyword`` producing it, the ``instanceLocation`` it annotates as a plain JSON Pointer, the ``keywordLocation`` of the keyword within the schema as a URI fragment JSON Pointer (e.g. ``#/properties/foo/title``), and the ``annotation`` value itself.
 Here's an implementation of the ``run`` command to add to our harness implementation:
 
 .. code:: lua
@@ -455,6 +477,20 @@ Here's an implementation of the ``run`` command to add to our harness implementa
 
 We call ``generate_validator`` to get our validation callable, then we apply it (``map`` it, though Lua has no builtin to do so) over all tests in the ``run`` request, returning a response which contains the ``seq`` alongside results for each test.
 The results are indicated positionally as shown above, meaning the first result in the results array should be the result for the first test in the input array.
+
+.. note::
+
+    The library we're wrapping has no API for collecting annotations, so a complete version of this harness should respond to ``run`` requests asking for ``annotations`` output by skipping each test:
+
+    .. code:: lua
+
+        if request.output == 'annotations' then
+          local results = {}
+          for _ = 1, #request.case.tests do
+            table.insert(results, { skipped = true, message = 'jsonschema cannot collect annotations' })
+          end
+          return { seq = request.seq, results = results }
+        end
 
 If we run ``bowtie`` again, we see::
 

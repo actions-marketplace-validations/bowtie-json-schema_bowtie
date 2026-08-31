@@ -1,27 +1,32 @@
 from __future__ import annotations
 
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from datetime import date
-from functools import cache
+from functools import cache, total_ordering
 from importlib.resources import files
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 from uuid import uuid4
 import json
-import os
 
 from attrs import Factory, asdict, evolve, field, frozen, mutable
-from referencing.jsonschema import EMPTY_REGISTRY, specification_with
+from referencing.jsonschema import (
+    DRAFT202012,
+    EMPTY_REGISTRY,
+    specification_with,
+)
 from rpds import HashTrieMap, HashTrieSet
 from url import URL
 import httpx
 import referencing_loaders
 
-from bowtie import HOMEPAGE, ORG_NAME
+from bowtie import HOMEPAGE
 from bowtie._commands import (
     START_V1,
     CaseErrored,
     Dialect as DialectCommand,
+    ExpectedAnnotations,
+    ExpectedValidity,
     SeqCase,
     SeqResult,
     StartedDialect,
@@ -37,6 +42,7 @@ from bowtie.exceptions import (
 
 if TYPE_CHECKING:
     from collections.abc import (
+        AsyncGenerator,
         AsyncIterator,
         Callable,
         Iterable,
@@ -53,6 +59,7 @@ if TYPE_CHECKING:
     from bowtie._commands import (
         AnyCaseResult,
         Command,
+        Expectation,
         Message,
         Run,
         Seq,
@@ -61,11 +68,33 @@ if TYPE_CHECKING:
     from bowtie._registry import ValidatorRegistry
     from bowtie._report import Reporter
 
-ORG_API = URL.parse("https://api.github.com/orgs/") / ORG_NAME
-CONTAINER_PACKAGES_API = ORG_API / "packages" / "container"
+
+#: Dialects whose identifiers `referencing` does not know, mapped to the
+#: specification whose resource structure they share, meaning the rules for
+#: finding ``$id``\ s, anchors and subschemas. A dialect only belongs here
+#: while it is too new for referencing to have shipped support, and the entry
+#: should be deleted once it has.
+REFERENCING_FALLBACK: Mapping[URL, Specification[Schema]] = {
+    URL.parse("https://json-schema.org/v1"): DRAFT202012,
+}
+
+
+def _dated_unless_prerelease(dialect: Dialect, _: Any, prerelease: bool):
+    """
+    Say when you were published, or say you have not been.
+
+    The dialect schema states the same rule as a ``oneOf``.
+    """
+    if prerelease == (dialect.first_publication_date is None):
+        return
+    raise ValueError(
+        "A dialect has a first publication date unless it is a prerelease, "
+        f"but {dialect.pretty_name} says otherwise.",
+    )
 
 
 @frozen
+@total_ordering
 class Dialect:
     """
     A dialect of JSON Schema.
@@ -74,7 +103,17 @@ class Dialect:
     pretty_name: str
     uri: URL = field(repr=False)
     short_name: str = field(repr=False)
-    first_publication_date: date = field(repr=False)
+    #: `None` for a prerelease dialect, which has no date to give.
+    first_publication_date: date | None = field(repr=False)
+    #: Is this dialect still being written? Bowtie knows about one so that
+    #: its tests can be run against harnesses which opt into it, but does
+    #: not treat it as the latest dialect, benchmark it, or report on it.
+    prerelease: bool = field(
+        default=False,
+        repr=False,
+        validator=_dated_unless_prerelease,
+    )
+
     aliases: Set[str] = field(
         default=cast("frozenset[str]", frozenset()),
         repr=False,
@@ -107,7 +146,19 @@ class Dialect:
     def __lt__(self, other: Any):
         if other.__class__ is not Dialect:
             return NotImplemented
-        return self.first_publication_date < other.first_publication_date
+        return self._age < other._age
+
+    @property
+    def _age(self):
+        """
+        Order dialects oldest to newest, with unpublished ones newest of all.
+
+        The short name breaks ties, so that two prerelease dialects still
+        have a total order and sort the same way every run.
+        """
+        if self.first_publication_date is None:
+            return date.max, self.short_name
+        return self.first_publication_date, self.short_name
 
     @classmethod
     @cache
@@ -142,19 +193,36 @@ class Dialect:
 
     @classmethod
     @cache
+    def published(cls) -> Iterable[Dialect]:
+        """
+        Every dialect Bowtie knows which is not still being written.
+
+        Bowtie knows about a prerelease dialect only so that its test suite
+        can be run against harnesses opting into it.
+        """
+        return HashTrieSet(each for each in cls.known() if not each.prerelease)
+
+    @classmethod
+    @cache
     def latest(cls):
         """
-        The latest dialect known to Bowtie.
+        The latest published dialect known to Bowtie.
+
+        Bowtie knows about dialects which are still being written, so that
+        their test suite can be run, but a prerelease is not what anyone
+        means by "latest", and defaulting to one would send schemas no
+        harness has agreed to support.
         """
-        return max(cls.known())
+        return max(cls.published())
 
     @classmethod
     def from_dict(
         cls,
-        firstPublicationDate: str,
         prettyName: str,
         shortName: str,
         uri: str,
+        firstPublicationDate: str | None = None,
+        prerelease: bool = False,
         aliases: Iterable[str] = (),
         hasBooleanSchemas: bool = True,
         **kwargs: Any,
@@ -168,7 +236,12 @@ class Dialect:
             uri=URL.parse(uri),
             pretty_name=prettyName,
             short_name=shortName,
-            first_publication_date=date.fromisoformat(firstPublicationDate),
+            first_publication_date=(
+                None
+                if firstPublicationDate is None
+                else date.fromisoformat(firstPublicationDate)
+            ),
+            prerelease=prerelease,
             aliases=frozenset(aliases),
             has_boolean_schemas=hasBooleanSchemas,
             **kwargs,
@@ -195,6 +268,9 @@ class Dialect:
         return str(self.uri)
 
     def specification(self, **kwargs: Any) -> Specification[Schema]:
+        fallback = REFERENCING_FALLBACK.get(self.uri)
+        if fallback is not None:
+            kwargs.setdefault("default", fallback)
         return specification_with(str(self.uri), **kwargs)
 
     @property
@@ -449,7 +525,7 @@ class DialectRunner:
     async def validate(
         self,
         run: Run,
-        expected: Sequence[bool | None],
+        expected: Sequence[Expectation],
     ) -> SeqResult:
         try:
             response: (
@@ -491,7 +567,7 @@ class Implementation:
     A running implementation under test.
     """
 
-    id: ConnectableId
+    report_id: ConnectableId
     info: ImplementationInfo
     _harness: HarnessClient = field(repr=False, alias="harness")
     _reporter: Reporter = field(alias="reporter")
@@ -512,25 +588,33 @@ class Implementation:
     @asynccontextmanager
     async def start(
         cls,
-        id: ConnectableId,
+        report_id: ConnectableId,
         reporter: Reporter,
         **kwargs: Any,
-    ) -> AsyncIterator[Self]:
+    ) -> AsyncGenerator[Self]:
         _harness = HarnessClient(**kwargs)
 
         try:
             harness, started = await _harness.transition(START_V1)
         except ProtocolError as err:
-            raise StartupFailed(id=id) from err
+            raise StartupFailed(id=report_id) from err
         except GotStderr as err:
-            raise StartupFailed(id=id, stderr=err.stderr.decode()) from err
+            raise StartupFailed(
+                id=report_id,
+                stderr=err.stderr.decode(),
+            ) from err
         else:
             if started is None:
-                raise StartupFailed(id=id)
+                raise StartupFailed(id=report_id)
 
         info = ImplementationInfo.from_dict(**started.implementation)
 
-        yield cls(harness=harness, id=id, info=info, reporter=reporter)
+        yield cls(
+            harness=harness,
+            report_id=report_id,
+            info=info,
+            reporter=reporter,
+        )
 
     def supports(self, *dialects: Dialect) -> bool:
         """
@@ -539,34 +623,11 @@ class Implementation:
         return self.info.dialects.issuperset(dialects)
 
     async def get_versions(self) -> Iterable[str]:
-        from github3.exceptions import (  # type: ignore[reportMissingTypeStubs]  # noqa: PLC0415
-            GitHubError,
-        )
-        from github3.models import (  # type: ignore[reportMissingTypeStubs]  # noqa: PLC0415
-            GitHubCore,
-        )
+        from bowtie import _github  # noqa: PLC0415
 
-        url = CONTAINER_PACKAGES_API / self.id / "versions"
-
-        gh = github()
-        pages: list[GitHubCore] = []
-        with suppress(GitHubError):
-            pages = gh._iter(count=-1, url=str(url), cls=GitHubCore)  # type: ignore[reportPrivateUsage]
-
-        versions: Set[str] = (
-            {self.info.version} if self.info.version else set()
-        )
-        for page in pages:
-            try:
-                tags = cast(
-                    "Iterable[str]",
-                    page.as_dict()["metadata"]["container"]["tags"],
-                )
-            except KeyError:
-                continue
-            else:
-                versions.update([tag for tag in tags if "." in tag])
-
+        versions: Set[str] = set(_github.versions_of(self.report_id))
+        if self.info.version:
+            versions.add(self.info.version)
         return sorted(versions, key=sortable_version_key, reverse=True)
 
     async def validate(
@@ -599,7 +660,7 @@ class Implementation:
             raise UnsupportedDialect(implementation=self, dialect=dialect)
         try:
             return await DialectRunner.for_dialect(
-                implementation=self.id,
+                implementation=self.report_id,
                 dialect=dialect,
                 harness=self._harness,
                 reporter=self._reporter,
@@ -627,6 +688,8 @@ class Example:
     """
     A validation example where we don't have any particularly expected result.
     """
+
+    assertions = None
 
     description: str
     instance: Any
@@ -662,11 +725,17 @@ class Example:
         cls,
         instance: Any = None,
         valid: bool | None = None,
+        assertions: list[dict[str, Any]] | None = None,
         **data: Any,
     ) -> Example | Test:
-        if valid is None:
+        if valid is None and assertions is None:
             return cls(**data, instance=instance)
-        return Test(**data, instance=instance, valid=valid)
+        return Test(
+            **data,
+            instance=instance,
+            valid=valid,
+            assertions=assertions,
+        )
 
 
 @frozen
@@ -677,14 +746,19 @@ class Test:
 
     description: str
     instance: Any
-    valid: bool
+    valid: bool | None = None
+    assertions: list[dict[str, Any]] | None = None
     comment: str | None = None
 
-    def expected(self) -> bool:
+    def expected(self) -> Expectation:
         """
-        Expect our expected validity result.
+        Expect our expected validity result or assertions.
         """
-        return self.valid
+        if self.assertions is not None:
+            return ExpectedAnnotations.from_serialized(self.assertions)
+        if self.valid is None:
+            return None
+        return ExpectedValidity(valid=self.valid)
 
     def syntax(self) -> RenderableType:
         from pygments.lexers.data import (  # type: ignore[reportMissingTypeStubs]  # noqa: PLC0415
@@ -756,7 +830,11 @@ class TestCase:
         as_dict = asdict(
             self,
             filter=lambda k, v: (
-                k.name != "registry" and (k.name != "comment" or v is not None)
+                k.name != "registry"
+                and (
+                    k.name not in {"comment", "assertions", "valid"}
+                    or v is not None
+                )
             ),
         )
         if self.registry:
@@ -787,7 +865,7 @@ class TestCase:
         """
         return json.dumps(self.serializable(), sort_keys=True)
 
-    def expected_results(self) -> Sequence[bool | None]:
+    def expected_results(self) -> Sequence[Expectation]:
         return [each.expected() for each in self.tests]
 
     def without_expected_results(self) -> Message:
@@ -796,7 +874,8 @@ class TestCase:
             {
                 k: v
                 for k, v in test.items()
-                if k != "valid" and (k != "comment" or v is not None)
+                if k not in {"valid", "assertions"}
+                and (k != "comment" or v is not None)
             }
             for test in serializable.pop("tests")
         ]
@@ -843,17 +922,3 @@ def sortable_version_key(version: str):
     """
     parts = version.split(".")
     return [int(part) if part.isdigit() else part for part in parts]
-
-
-def github():
-    """
-    Construct a GitHub client, optionally looking for a token.
-
-    This extra behavior is just useful in GitHub actions workflows, and
-    presumably if ``github3.py`` was more active would be default behavior.
-    """
-    from github3 import (  # type: ignore[reportMissingTypeStubs]  # noqa: PLC0415
-        GitHub,
-    )
-
-    return GitHub(token=os.environ.get("GITHUB_TOKEN", ""))
