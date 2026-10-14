@@ -6,7 +6,7 @@
   "remoteUser": "vscode",
   "features": {
     // Docker CE, not moby, as Debian trixie has no moby packages.
-    "ghcr.io/devcontainers/features/docker-in-docker:4.1.0": {
+    "ghcr.io/devcontainers/features/docker-in-docker:4.1.3": {
       "moby": false
     },
     "ghcr.io/devcontainers/features/node:2.1.0": {},
