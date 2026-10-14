@@ -9,7 +9,7 @@
     "ghcr.io/devcontainers/features/docker-in-docker:4.1.0": {
       "moby": false
     },
-    "ghcr.io/devcontainers/features/node:2.1.0": {},
+    "ghcr.io/devcontainers/features/node:2.1.1": {},
     "ghcr.io/devcontainers/features/sshd:1.1.0": {}
   },
   // Put the project's environment on $PATH so bowtie itself (along with pytest, nox, ...) is directly runnable,
